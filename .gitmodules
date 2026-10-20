@@ -1,0 +1,3 @@
+[submodule "zvm-core"]
+	path = zvm-core
+	url = https://github.com/Zenoglyphs-VM/zvm-core.git

@@ -1,0 +1,10 @@
+# Only the Go module goes into the build.
+.git
+**/node_modules
+**/dist
+bin/
+*.exe
+*.db
+*.db-*
+.env
+secrets/

@@ -1,0 +1,3 @@
+# Text is stored and checked out with LF, so a clone on Linux, where CI runs
+# and most people work, gets every script and source file as it was written.
+* text=auto eol=lf
