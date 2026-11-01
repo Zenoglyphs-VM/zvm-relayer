@@ -212,11 +212,11 @@ type starve struct {
 }
 
 type Relayer struct {
-	ready         atomic.Bool
-	runStarted    atomic.Bool
-	recoveryPhase atomic.Uint32
-	cfg           Config
-	signer        types.Signer
+	admissionReady atomic.Bool
+	runStarted     atomic.Bool
+	recoveryPhase  atomic.Uint32
+	cfg            Config
+	signer         types.Signer
 
 	mu      sync.Mutex
 	senders map[common.Address]*sender
@@ -641,12 +641,12 @@ func (r *Relayer) Run(ctx context.Context) error {
 		}
 		return err
 	}
-	r.ready.Store(true)
+	r.admissionReady.Store(true)
 	r.recoveryPhase.Store(1)
 	if r.adopted != nil {
 		close(r.adopted)
 	}
-	defer func() { r.ready.Store(false); r.recoveryPhase.Store(3) }()
+	defer func() { r.admissionReady.Store(false); r.recoveryPhase.Store(3) }()
 
 	var wg sync.WaitGroup
 	for i := range r.cfg.Accounts {
@@ -1560,7 +1560,7 @@ func (r *Relayer) cachedRoom(shard int) int {
 }
 
 // Ready is admission readiness, not transaction inclusion or finality.
-func (r *Relayer) Ready() bool { return r.ready.Load() }
+func (r *Relayer) Ready() bool { return r.admissionReady.Load() }
 
 func (r *Relayer) recoveryStatus() string {
 	switch r.recoveryPhase.Load() {

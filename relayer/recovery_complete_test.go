@@ -55,7 +55,7 @@ func recoveryFixtureFor(t *testing.T, height int, raws [][]byte) *recoveryFixtur
 		}
 		raws = [][]byte{send(t, key, 0, zvm(1), 1)}
 	}
-	f := &recoveryFixture{t: t, raws: raws, key: key, header: &types.Header{Number: big.NewInt(1_000_000), BaseFee: big.NewInt(1), GasLimit: 30_000_000}}
+	f := &recoveryFixture{t: t, raws: raws, key: key, header: &types.Header{Difficulty: big.NewInt(0), Number: big.NewInt(1_000_000), BaseFee: big.NewInt(1), GasLimit: 30_000_000}}
 	f.address = znn.NewAccount(devnet.Key(202), nil, 69).Address()
 	payload, err := derive.EncodeBatch(raws, derive.BatchZlib)
 	if err != nil {

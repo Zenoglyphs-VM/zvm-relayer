@@ -52,7 +52,7 @@ type recoveryProcessFixture struct {
 
 func newRecoveryProcessFixture(t *testing.T, mode string) *recoveryProcessFixture {
 	t.Helper()
-	f := &recoveryProcessFixture{t: t, mode: mode, header: &types.Header{Number: big.NewInt(100), BaseFee: big.NewInt(1), GasLimit: 30_000_000}, pageEntered: make(chan struct{}), releasePage: make(chan struct{})}
+	f := &recoveryProcessFixture{t: t, mode: mode, header: &types.Header{Difficulty: big.NewInt(0), Number: big.NewInt(100), BaseFee: big.NewInt(1), GasLimit: 30_000_000}, pageEntered: make(chan struct{}), releasePage: make(chan struct{})}
 	key, err := crypto.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
