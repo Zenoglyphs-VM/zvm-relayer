@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/ethclient"
 
@@ -131,31 +130,7 @@ func runRelayer(args []string) error {
 				// replacement. That is what corrupted three steps of the
 				// 2026-09-16 benchmark matrix. `latest` stays the chain's own
 				// answer, so only a caller that asks for `pending` changes.
-				var ps []json.RawMessage
-				if err := json.Unmarshal(params, &ps); err != nil || len(ps) == 0 {
-					return nil, &rpcError{Code: -32602, Message: "expected an address and a block tag"}
-				}
-				var addrHex string
-				if err := json.Unmarshal(ps[0], &addrHex); err != nil || !common.IsHexAddress(addrHex) {
-					return nil, &rpcError{Code: -32602, Message: "expected an address"}
-				}
-				tag := "latest"
-				if len(ps) > 1 {
-					_ = json.Unmarshal(ps[1], &tag)
-				}
-				addr := common.HexToAddress(addrHex)
-				if tag != "pending" {
-					n, err := eth.NonceAt(ctx, addr, nil)
-					if err != nil {
-						return nil, &rpcError{Code: -32603, Message: err.Error()}
-					}
-					return hexutil.Uint64(n), nil
-				}
-				n, err := r.NextNonce(ctx, addr)
-				if err != nil {
-					return nil, &rpcError{Code: -32603, Message: err.Error()}
-				}
-				return hexutil.Uint64(n), nil
+				return transactionCount(ctx, params, eth, r.NextNonce)
 			case "eth_chainId":
 				return hexutil.Uint64(cfg.L2ChainID), nil
 			case "net_version":
