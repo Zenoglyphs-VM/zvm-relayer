@@ -40,6 +40,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      - name: Scope Git access to the exact container checkout
+        run: |
+          test -n "$GITHUB_WORKSPACE"
+          test "$PWD" = "$GITHUB_WORKSPACE"
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=safe.directory
+          export GIT_CONFIG_VALUE_0="$GITHUB_WORKSPACE"
+          export GIT_CONFIG_KEY_1=safe.directory
+          export GIT_CONFIG_VALUE_1="$GITHUB_WORKSPACE/zvm-core"
+          test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
+          test -z "$(git status --porcelain)"
+          test -z "$(git -C zvm-core status --porcelain)"
+          printf '%s\n' "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT" "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0" "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0" "GIT_CONFIG_KEY_1=$GIT_CONFIG_KEY_1" "GIT_CONFIG_VALUE_1=$GIT_CONFIG_VALUE_1" >> "$GITHUB_ENV"
       - name: Verify the pinned Go toolchain and original Core source
         run: |
           go version
@@ -47,6 +60,12 @@ jobs:
           test "$(git -C zvm-core rev-parse HEAD)" = 29e6d9b30be94de3772c850c7a1e9811585a8833
       - name: Build the actual production relayer with race instrumentation once
         run: go build -race -o "$RUNNER_TEMP/zvm-relayer-recovery" ./cmd/zvm-relayer
+      - name: Verify the embedded production source revision
+        run: |
+          relayer_build_metadata="$(go version -m "$RUNNER_TEMP/zvm-relayer-recovery")"
+          printf '%s\n' "$relayer_build_metadata"
+          printf '%s\n' "$relayer_build_metadata" | grep -F "vcs.revision=$(git rev-parse HEAD)"
+          printf '%s\n' "$relayer_build_metadata" | grep -F 'vcs.modified=false'
       - name: Qualify complete recovery and bounded admission in actual processes
         env:
           ZVM_RELAYER_RECOVERY_BINARY: ${{ runner.temp }}/zvm-relayer-recovery
