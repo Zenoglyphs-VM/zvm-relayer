@@ -298,29 +298,14 @@ func TestARestartAdoptsWhatIsInFlight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocks := []*znn.AccountBlock{
-		{Hash: znn.Hash{2}, Height: 2, ToAddress: rollup.Inbox, Data: pendingData},
-		// Confirmed at a momentum already derived: settled, not in flight.
-		{Hash: znn.Hash{3}, Height: 3, ToAddress: rollup.Inbox, Data: derivedData,
-			ConfirmationDetail: &znn.ConfirmationDetail{MomentumHeight: 100}},
-	}
-	l1 := fakeZNN(t, func(method string) any {
-		switch method {
-		case "embedded.plasma.get":
-			return znn.PlasmaInfo{CurrentPlasma: 105_000_000, MaxPlasma: 105_000_000}
-		case "ledger.getFrontierAccountBlock":
-			return blocks[1]
-		case "ledger.getAccountBlocksByHeight":
-			return znn.BlockList{Count: 2, List: blocks}
-		}
-		return nil
-	})
-	var nonce atomic.Uint64
-	nonce.Store(5) // nonce 4 landed already
-	r := submitting(testRelayer(fakeChain(t, &nonce)))
-	r.cfg.L1 = l1
-	r.cfg.Accounts = []*znn.Account{znn.NewAccount(devnet.Key(202), l1, 69)}
-	r.capacity = []uint64{0}
+	f := recoveryFixtureFor(t, 3, raws)
+	f.blocks[1].Data = pendingData
+	f.blocks[2].ToAddress = rollup.Inbox
+	f.blocks[2].Data = derivedData
+	f.blocks[2].ConfirmationDetail = &znn.ConfirmationDetail{MomentumHeight: 100}
+	f.nonce = 5 // nonce 4 landed already
+	f.rebuild()
+	r := f.relayer()
 
 	if err := r.recoverInFlight(context.Background()); err != nil {
 		t.Fatal(err)

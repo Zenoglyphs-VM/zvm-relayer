@@ -11,6 +11,7 @@ permissions:
 jobs:
   go:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,4 +23,25 @@ jobs:
 
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -json -count=1 -timeout=3m ./...
+      - run: go test -race -json -count=1 -timeout=5m ./...
+
+
+  recovery-process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Verify original public Core pin
+        run: test "$(git -C zvm-core rev-parse HEAD)" = 29e6d9b30be94de3772c850c7a1e9811585a8833
+      - name: Build the actual production relayer with race instrumentation
+        run: go build -race -o "$RUNNER_TEMP/zvm-relayer-recovery" ./cmd/zvm-relayer
+      - name: Qualify complete-history recovery and volatile acknowledgment in real processes
+        env:
+          ZVM_RELAYER_RECOVERY_BINARY: ${{ runner.temp }}/zvm-relayer-recovery
+        run: go test -race -json -count=1 -timeout=3m -run '^TestRecoveryCLIProcesses$' ./cmd/zvm-relayer

@@ -36,6 +36,8 @@ import (
 const batchRoom = znn.MaxDataLength - 2
 
 type Config struct {
+	// Recovery bounds complete startup history; exhaustion refuses admission.
+	Recovery RecoveryLimits
 	Rollup   *rollup.Config
 	L1       *znn.Client
 	Eth      *ethclient.Client
@@ -210,8 +212,11 @@ type starve struct {
 }
 
 type Relayer struct {
-	cfg    Config
-	signer types.Signer
+	ready         atomic.Bool
+	runStarted    atomic.Bool
+	recoveryPhase atomic.Uint32
+	cfg           Config
+	signer        types.Signer
 
 	mu      sync.Mutex
 	senders map[common.Address]*sender
@@ -467,12 +472,8 @@ func (r *Relayer) submit(ctx context.Context, raw []byte) (common.Hash, error) {
 	if err != nil {
 		return common.Hash{}, reject("invalid signature: %v", err)
 	}
-	if r.adopted != nil {
-		select {
-		case <-r.adopted:
-		case <-ctx.Done():
-			return common.Hash{}, ctx.Err()
-		}
+	if err := r.awaitRecovery(ctx); err != nil {
+		return common.Hash{}, err
 	}
 
 	r.mu.Lock()
@@ -550,7 +551,7 @@ func (r *Relayer) submit(ctx context.Context, raw []byte) (common.Hash, error) {
 	if old := s.queued[n]; old != nil {
 		r.nQueued--
 	}
-	e := &entry{tx: tx, raw: raw, from: from, received: now, queuedAt: now}
+	e := &entry{tx: tx, raw: append([]byte(nil), raw...), from: from, received: now, queuedAt: now}
 	if s.queued[n] == nil {
 		r.load[s.shard]++
 	}
@@ -623,14 +624,30 @@ func (r *Relayer) poke(shard int) {
 
 // Run starts one poster per account and the inclusion tracker.
 func (r *Relayer) Run(ctx context.Context) error {
-	// A relayer that cannot read its accounts' chains still relays; it just
-	// may post again what it had in flight before it stopped.
-	if err := r.recoverInFlight(ctx); err != nil {
-		r.cfg.Log.Warn("adopting batches in flight from before this start", "err", err)
+	if !r.runStarted.CompareAndSwap(false, true) {
+		return errors.New("relayer Run may only start once")
 	}
+	if err := r.recoverInFlight(ctx); err != nil {
+		r.recoveryPhase.Store(2)
+		if r.adopted != nil {
+			close(r.adopted)
+		}
+		return fmt.Errorf("complete startup recovery failed: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		r.recoveryPhase.Store(2)
+		if r.adopted != nil {
+			close(r.adopted)
+		}
+		return err
+	}
+	r.ready.Store(true)
+	r.recoveryPhase.Store(1)
 	if r.adopted != nil {
 		close(r.adopted)
 	}
+	defer func() { r.ready.Store(false); r.recoveryPhase.Store(3) }()
+
 	var wg sync.WaitGroup
 	for i := range r.cfg.Accounts {
 		wg.Add(1)
@@ -1326,21 +1343,25 @@ func (r *Relayer) sweep() {
 
 // Snapshot is the relayer's status.
 type Snapshot struct {
-	Accounts      []string `json:"accounts"`
-	Queued        int      `json:"queued"`
-	PostedPending int      `json:"postedPending"`
-	InFlight      []int    `json:"inFlightBlocks"`
-	Senders       int      `json:"senders"`
-	Received      uint64   `json:"received"`
-	Rejected      uint64   `json:"rejected"`
-	Posted        uint64   `json:"posted"`
-	Included      uint64   `json:"included"`
-	Requeued      uint64   `json:"requeued"`
-	Discarded     uint64   `json:"discarded"`
-	Batches       uint64   `json:"batches"`
-	BatchBytes    uint64   `json:"batchBytes"`
-	RawBytes      uint64   `json:"rawBytes"`
-	PublishErrors uint64   `json:"publishErrors"`
+	Ready            bool     `json:"ready"`
+	RecoveryStatus   string   `json:"recoveryStatus"`
+	AdmissionMode    string   `json:"admissionMode"`
+	AdmissionDurable bool     `json:"admissionDurable"`
+	Accounts         []string `json:"accounts"`
+	Queued           int      `json:"queued"`
+	PostedPending    int      `json:"postedPending"`
+	InFlight         []int    `json:"inFlightBlocks"`
+	Senders          int      `json:"senders"`
+	Received         uint64   `json:"received"`
+	Rejected         uint64   `json:"rejected"`
+	Posted           uint64   `json:"posted"`
+	Included         uint64   `json:"included"`
+	Requeued         uint64   `json:"requeued"`
+	Discarded        uint64   `json:"discarded"`
+	Batches          uint64   `json:"batches"`
+	BatchBytes       uint64   `json:"batchBytes"`
+	RawBytes         uint64   `json:"rawBytes"`
+	PublishErrors    uint64   `json:"publishErrors"`
 	// Rebids counts blocks replaced because they had fallen behind the plasma
 	// price. On a chain without dynamic plasma it stays zero.
 	Rebids uint64 `json:"rebids"`
@@ -1368,6 +1389,9 @@ type Snapshot struct {
 // replacement. That is precisely what corrupted three steps of the 2026-09-16
 // benchmark matrix, and it is why this exists.
 func (r *Relayer) NextNonce(ctx context.Context, addr common.Address) (uint64, error) {
+	if err := r.awaitRecovery(ctx); err != nil {
+		return 0, err
+	}
 	chainNonce, err := r.cfg.Eth.NonceAt(ctx, addr, nil)
 	if err != nil {
 		return 0, err
@@ -1443,6 +1467,7 @@ func (r *Relayer) Snapshot() Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s := Snapshot{
+		Ready: r.Ready(), RecoveryStatus: r.recoveryStatus(), AdmissionMode: "volatile", AdmissionDurable: false,
 		InFlight: append([]int(nil), r.inFlight...), Senders: len(r.senders),
 		Received: r.stats.Received.Load(), Rejected: r.stats.Rejected.Load(), Posted: r.stats.Posted.Load(),
 		Included: r.stats.Included.Load(), Requeued: r.stats.Requeued.Load(), Discarded: r.stats.Discarded.Load(),
@@ -1532,4 +1557,34 @@ func (r *Relayer) cachedRoom(shard int) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.room[shard]
+}
+
+// Ready is admission readiness, not transaction inclusion or finality.
+func (r *Relayer) Ready() bool { return r.ready.Load() }
+
+func (r *Relayer) recoveryStatus() string {
+	switch r.recoveryPhase.Load() {
+	case 1:
+		return "complete"
+	case 2:
+		return "failed"
+	case 3:
+		return "stopped"
+	}
+	return "starting"
+}
+
+func (r *Relayer) awaitRecovery(ctx context.Context) error {
+	if r.adopted == nil {
+		return nil
+	} // package-local fixtures with no service lifecycle
+	select {
+	case <-r.adopted:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if !r.Ready() {
+		return errors.New("relayer admission unavailable: recovery is not complete")
+	}
+	return nil
 }

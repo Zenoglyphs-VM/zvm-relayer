@@ -45,6 +45,8 @@ func runRelayer(args []string) error {
 	floorBP := fs.Uint64("footprint-floor-bp", relayer.DefaultFootprintFloorBP, "the smallest share of NoM this relayer will take, in basis points")
 	ceilingBP := fs.Uint64("footprint-ceiling-bp", relayer.DefaultFootprintCeilingBP, "the largest share of NoM this relayer will take, in basis points")
 	minTip := fs.Uint64("min-tip", relayer.DefaultMinTipWei, "smallest priority fee this relayer will carry, wei per gas (0: carry anything)")
+	recoveryBlocks := fs.Uint64("recovery-max-blocks", 65536, "maximum complete startup account-history blocks; exhaustion refuses startup")
+	recoveryTimeout := fs.Duration("recovery-timeout", 2*time.Minute, "maximum complete startup recovery duration")
 	fs.Parse(args)
 
 	cfg, err := rollup.Load(*configPath)
@@ -72,7 +74,8 @@ func runRelayer(args []string) error {
 		accts = append(accts, a)
 	}
 	rc := relayer.Config{
-		Rollup: cfg, L1: l1, Eth: eth, Accounts: accts,
+		Recovery: relayer.RecoveryLimits{MaxBlocks: *recoveryBlocks, Timeout: *recoveryTimeout},
+		Rollup:   cfg, L1: l1, Eth: eth, Accounts: accts,
 		MaxWait: *maxWait, MaxInFlight: *maxInFlight,
 		QueueTTL: *queueTTL, MaxRequeues: *maxRequeues, MaxBatchGas: *maxBatchGas,
 		Log: slog.Default().With("svc", "relayer"),
@@ -91,7 +94,13 @@ func runRelayer(args []string) error {
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, r.Snapshot())
 	})
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		if !r.Ready() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "POST JSON-RPC here, or GET /status", http.StatusMethodNotAllowed)
