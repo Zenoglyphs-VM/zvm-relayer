@@ -32,6 +32,17 @@ type RecoveryLimits struct {
 	Timeout               time.Duration
 }
 
+// Checked resolves zero-valued fields to their defaults and validates every
+// independent bound. Zero never means unlimited; it retains the library default.
+func (l RecoveryLimits) Checked() (RecoveryLimits, error) { return l.checked() }
+
+// Stable errors distinguish which operator-selected response budget refused a
+// read without exposing an endpoint, a remote diagnostic or signed bytes.
+var (
+	ErrRecoveryResponseBytes      = errors.New("recovery single response byte limit exceeded")
+	ErrRecoveryTotalResponseBytes = errors.New("recovery total response byte limit exceeded")
+)
+
 func (l RecoveryLimits) checked() (RecoveryLimits, error) {
 	if l.MaxBlocks == 0 {
 		l.MaxBlocks = 65536
@@ -112,6 +123,15 @@ func (q *recoveryReader) read(ctx context.Context, out any, method string, param
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	remaining := q.limits.MaxTotalResponseBytes - q.responseBytes
+	if remaining <= 0 {
+		return ErrRecoveryTotalResponseBytes
+	}
+	cap := min(q.limits.MaxResponseBytes, remaining)
+	byteLimitError := ErrRecoveryResponseBytes
+	if remaining < q.limits.MaxResponseBytes {
+		byteLimitError = ErrRecoveryTotalResponseBytes
+	}
 	if q.calls >= q.limits.MaxCalls {
 		return errors.New("recovery RPC call limit exceeded")
 	}
@@ -136,14 +156,16 @@ func (q *recoveryReader) read(ctx context.Context, out any, method string, param
 	if response.StatusCode != http.StatusOK {
 		return errors.New("recovery RPC HTTP status refused")
 	}
-	cap := min(q.limits.MaxResponseBytes, q.limits.MaxTotalResponseBytes-q.responseBytes)
-	if cap <= 0 || response.ContentLength > cap {
-		return errors.New("recovery response byte limit exceeded")
+	if response.ContentLength > cap {
+		return byteLimitError
 	}
 	raw, err := io.ReadAll(io.LimitReader(response.Body, cap+1))
 	q.responseBytes += int64(len(raw))
-	if err != nil || int64(len(raw)) > cap {
-		return errors.New("recovery response incomplete or over byte limit")
+	if int64(len(raw)) > cap {
+		return byteLimitError
+	}
+	if err != nil {
+		return errors.New("recovery response incomplete")
 	}
 	var envelope struct {
 		JSONRPC string          `json:"jsonrpc"`
