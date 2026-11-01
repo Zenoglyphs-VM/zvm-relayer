@@ -223,7 +223,7 @@ type recoveryOwnedProcess struct {
 	url      string
 }
 
-func (f *recoveryProcessFixture) start(binary string, blocks string) *recoveryOwnedProcess {
+func (f *recoveryProcessFixture) start(binary string, blocks string, extra ...string) *recoveryOwnedProcess {
 	f.t.Helper()
 	dir := f.t.TempDir()
 	cfg := &rollup.Config{L1ChainID: 69, L2ChainID: recoveryProcessChain, L1StartHeight: 1, Inbox: rollup.Inbox, GasLimit: 30_000_000, MaxTxGas: 30_000_000, MaxAssembledBytes: 1 << 20, MaxBatchBytes: 4 << 20}
@@ -245,7 +245,11 @@ func (f *recoveryProcessFixture) start(binary string, blocks string) *recoveryOw
 	}
 	p := &recoveryOwnedProcess{done: make(chan error, 1), output: &recoveryCappedOutput{}, url: "http://" + listen}
 	p.command = exec.Command(binary, "relayer", "-config", config, "-l1", f.l1.URL, "-eth", f.eth.URL, "-listen", listen, "-accounts", "1", "-first-index", "202", "-footprint=false", "-max-wait", "1h", "-recovery-timeout", "5s", "-recovery-max-blocks", blocks)
+	p.command.Args = append(p.command.Args, extra...)
 	p.command.Env = []string{"PATH=" + os.Getenv("PATH"), "LANG=C", "TZ=UTC", "GORACE=halt_on_error=1"}
+	if limit := os.Getenv("ZVM_RELAYER_PROFILE_GOMEMLIMIT"); limit != "" {
+		p.command.Env = append(p.command.Env, "GOMEMLIMIT="+limit)
+	}
 	p.command.Stdout = p.output
 	p.command.Stderr = p.output
 	if err = p.command.Start(); err != nil {

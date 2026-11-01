@@ -8,6 +8,7 @@
 package relayer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -38,6 +39,7 @@ const batchRoom = znn.MaxDataLength - 2
 type Config struct {
 	// Recovery bounds complete startup history; exhaustion refuses admission.
 	Recovery RecoveryLimits
+	Limits   Limits
 	Rollup   *rollup.Config
 	L1       *znn.Client
 	Eth      *ethclient.Client
@@ -119,8 +121,9 @@ type entry struct {
 }
 
 type sender struct {
-	addr  common.Address
-	shard int
+	rawBytes int64
+	addr     common.Address
+	shard    int
 	// next is the lowest nonce not yet posted. Queued entries at or above it
 	// are posted in order; a gap holds everything behind it.
 	next    uint64
@@ -245,8 +248,11 @@ type Relayer struct {
 	// time, which is the very thing adopting is for.
 	adopted chan struct{}
 	// Running totals, so /status costs nothing at a hundred thousand senders.
-	nQueued int
-	nPosted int
+	nQueued       int
+	nPosted       int
+	retainedBytes int64
+	admitOnce     sync.Once
+	admission     chan struct{}
 
 	head headCache
 
@@ -369,6 +375,10 @@ type account struct {
 // against 200 offered, while the same code did 206 at 1,000 wallets — where
 // the cache covers everyone after the first pass.
 func (r *Relayer) headFor(ctx context.Context, from common.Address) (*types.Header, *account, error) {
+	limits, err := r.cfg.Limits.checked()
+	if err != nil {
+		return nil, nil, err
+	}
 	c := &r.head
 
 	// A momentum is 10 s, so a head older than a second is worth re-reading;
@@ -423,7 +433,7 @@ func (r *Relayer) headFor(ctx context.Context, from common.Address) (*types.Head
 	}
 	acct = &account{balance: (*big.Int)(&bal), nonce: uint64(nonce)}
 	c.mu.Lock()
-	if c.header != nil && c.header.Number.Cmp(header.Number) == 0 {
+	if c.header != nil && c.header.Number.Cmp(header.Number) == 0 && (c.accounts[from] != nil || len(c.accounts) < limits.MaxSenders) {
 		c.accounts[from] = acct
 	}
 	c.mu.Unlock()
@@ -450,6 +460,19 @@ func (r *Relayer) Submit(ctx context.Context, raw []byte) (common.Hash, error) {
 }
 
 func (r *Relayer) submit(ctx context.Context, raw []byte) (common.Hash, error) {
+	limits, err := r.cfg.Limits.checked()
+	if err != nil {
+		return common.Hash{}, err
+	}
+	ctx, release, err := r.beginAdmission(ctx, limits)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	defer release()
+	if len(raw) > r.cfg.Rollup.MaxAssembledBytes-2 {
+		return common.Hash{}, reject("transaction is %d bytes", len(raw))
+	}
+	raw = bytes.Clone(raw)
 	tx := new(types.Transaction)
 	if err := tx.UnmarshalBinary(raw); err != nil {
 		return common.Hash{}, reject("undecodable transaction: %v", err)
@@ -504,9 +527,29 @@ func (r *Relayer) submit(ctx context.Context, raw []byte) (common.Hash, error) {
 		return common.Hash{}, reject("insufficient funds: balance %s, transaction costs up to %s", acct.balance, tx.Cost())
 	}
 
+	if tx.Nonce() > acct.nonce && tx.Nonce()-acct.nonce > limits.MaxNonceGap {
+		return common.Hash{}, &CapacityError{"nonce gap", int64(min(tx.Nonce()-acct.nonce, ^uint64(0)>>1)), int64(min(limits.MaxNonceGap, ^uint64(0)>>1))}
+	}
+	if tx.Nonce() < acct.nonce {
+		return common.Hash{}, reject("nonce too low: %d, chain is %d", tx.Nonce(), acct.nonce)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.byHash[tx.Hash()] != nil {
+		return tx.Hash(), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return common.Hash{}, err
+	}
 	s := r.senders[from]
+	var previous *entry
+	if s != nil {
+		previous = s.queued[tx.Nonce()]
+	}
+	if err := r.checkCapacity(limits, from, len(raw), previous); err != nil {
+		return common.Hash{}, err
+	}
 	if s == nil {
 		s = &sender{addr: from, shard: r.pickShard(from), next: acct.nonce,
 			queued: map[uint64]*entry{}, posted: map[uint64]*entry{}}
@@ -545,20 +588,20 @@ func (r *Relayer) submit(ctx context.Context, raw []byte) (common.Hash, error) {
 		if tx.GasFeeCap().Cmp(old.tx.GasFeeCap()) <= 0 || tx.GasTipCap().Cmp(old.tx.GasTipCap()) <= 0 {
 			return common.Hash{}, reject("replacement transaction underpriced")
 		}
-		delete(r.byHash, old.tx.Hash())
+		r.forget(old.tx.Hash())
 	}
 	now := time.Now()
 	if old := s.queued[n]; old != nil {
 		r.nQueued--
 	}
-	e := &entry{tx: tx, raw: append([]byte(nil), raw...), from: from, received: now, queuedAt: now}
+	e := &entry{tx: tx, raw: raw, from: from, received: now, queuedAt: now}
 	if s.queued[n] == nil {
 		r.load[s.shard]++
 	}
 	s.queued[n] = e
 	r.nQueued++
 	s.lastUse = now
-	r.byHash[tx.Hash()] = e
+	r.remember(e)
 	r.poke(s.shard)
 	return tx.Hash(), nil
 }
@@ -626,6 +669,13 @@ func (r *Relayer) poke(shard int) {
 func (r *Relayer) Run(ctx context.Context) error {
 	if !r.runStarted.CompareAndSwap(false, true) {
 		return errors.New("relayer Run may only start once")
+	}
+	if _, err := r.cfg.Limits.checked(); err != nil {
+		r.recoveryPhase.Store(2)
+		if r.adopted != nil {
+			close(r.adopted)
+		}
+		return err
 	}
 	if err := r.recoverInFlight(ctx); err != nil {
 		r.recoveryPhase.Store(2)
@@ -1218,7 +1268,7 @@ func (r *Relayer) settle(ctx context.Context, b *batch, included map[common.Hash
 		s.postedGas -= e.tx.Gas()
 		r.nPosted--
 		if included[e.tx.Hash()] {
-			delete(r.byHash, e.tx.Hash())
+			r.forget(e.tx.Hash())
 			r.stats.Included.Add(1)
 			r.load[s.shard]--
 			raise(e.from, e.tx.Nonce()+1)
@@ -1305,7 +1355,7 @@ func requeuePlan(txNonce, chainNonce, cursor uint64, requeues, maxRequeues int) 
 // discard forgets a transaction the relayer will never land. Callers hold the
 // lock, and the entry must already be out of its sender's maps.
 func (r *Relayer) discard(e *entry) {
-	delete(r.byHash, e.tx.Hash())
+	r.forget(e.tx.Hash())
 	r.stats.Discarded.Add(1)
 }
 
@@ -1343,6 +1393,8 @@ func (r *Relayer) sweep() {
 
 // Snapshot is the relayer's status.
 type Snapshot struct {
+	RetainedRawBytes int64    `json:"retainedRawBytes"`
+	Limits           Limits   `json:"limits"`
 	Ready            bool     `json:"ready"`
 	RecoveryStatus   string   `json:"recoveryStatus"`
 	AdmissionMode    string   `json:"admissionMode"`
@@ -1389,6 +1441,15 @@ type Snapshot struct {
 // replacement. That is precisely what corrupted three steps of the 2026-09-16
 // benchmark matrix, and it is why this exists.
 func (r *Relayer) NextNonce(ctx context.Context, addr common.Address) (uint64, error) {
+	limits, err := r.cfg.Limits.checked()
+	if err != nil {
+		return 0, err
+	}
+	ctx, release, err := r.beginAdmission(ctx, limits)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	if err := r.awaitRecovery(ctx); err != nil {
 		return 0, err
 	}
@@ -1466,7 +1527,9 @@ func (r *Relayer) senderStatuses(limit int) []SenderStatus {
 func (r *Relayer) Snapshot() Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	limits, _ := r.cfg.Limits.checked()
 	s := Snapshot{
+		RetainedRawBytes: r.retainedBytes, Limits: limits,
 		Ready: r.Ready(), RecoveryStatus: r.recoveryStatus(), AdmissionMode: "volatile", AdmissionDurable: false,
 		InFlight: append([]int(nil), r.inFlight...), Senders: len(r.senders),
 		Received: r.stats.Received.Load(), Rejected: r.stats.Rejected.Load(), Posted: r.stats.Posted.Load(),

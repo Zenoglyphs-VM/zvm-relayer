@@ -418,6 +418,10 @@ func (r *Relayer) recoverInFlight(parent context.Context) error {
 // installRecovery constructs the complete replacement before taking the lock;
 // a failed late account, nonce or collision check preserves all live maps.
 func (r *Relayer) installRecovery(ctx context.Context, staged *Relayer, found []*recovered, nonces map[common.Address]uint64, now time.Time) error {
+	limits, err := r.cfg.Limits.checked()
+	if err != nil {
+		return err
+	}
 	for _, item := range found {
 		b := &batch{shard: item.shard, block: item.block.Hash, height: item.block.Height, published: now, bytes: item.bytes}
 		if detail := item.block.ConfirmationDetail; detail != nil {
@@ -427,6 +431,9 @@ func (r *Relayer) installRecovery(ctx context.Context, staged *Relayer, found []
 			from, nonce := item.senders[i], tx.Nonce()
 			if nonce < nonces[from] {
 				continue
+			}
+			if err := staged.checkCapacity(limits, from, len(item.raws[i]), nil); err != nil {
+				return err
 			}
 			s := staged.senders[from]
 			if s == nil {
@@ -444,7 +451,7 @@ func (r *Relayer) installRecovery(ctx context.Context, staged *Relayer, found []
 			s.posted[nonce] = e
 			s.postedGas += tx.Gas()
 			s.lastUse = now
-			staged.byHash[tx.Hash()] = e
+			staged.remember(e)
 			staged.nPosted++
 			staged.load[item.shard]++
 			b.entries = append(b.entries, e)
@@ -471,6 +478,7 @@ func (r *Relayer) installRecovery(ctx context.Context, staged *Relayer, found []
 	r.senders, r.byHash, r.byShard, r.batches = staged.senders, staged.byHash, staged.byShard, staged.batches
 	r.load, r.inFlight, r.capacity, r.nPosted = staged.load, staged.inFlight, staged.capacity, staged.nPosted
 	r.nQueued = 0
+	r.retainedBytes = staged.retainedBytes
 	r.cfg.Log.Info("complete account history recovery finished", "batches", len(r.batches), "transactions", r.nPosted)
 	return nil
 }

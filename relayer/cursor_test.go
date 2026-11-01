@@ -138,7 +138,7 @@ func post(r *Relayer, s *sender, nonces ...uint64) *batch {
 		e := s.queued[n]
 		if e == nil {
 			e = funderEntry(s.addr, n)
-			r.byHash[e.tx.Hash()] = e
+			r.remember(e)
 		} else {
 			delete(s.queued, n)
 		}
@@ -224,7 +224,7 @@ func TestOnlyAGappedEntryIsSwept(t *testing.T) {
 		e := funderEntry(from, n)
 		e.queuedAt = old
 		s.queued[n] = e
-		r.byHash[e.tx.Hash()] = e
+		r.remember(e)
 		r.nQueued++
 	}
 	for _, n := range []uint64{5, 6, 9, 12} {

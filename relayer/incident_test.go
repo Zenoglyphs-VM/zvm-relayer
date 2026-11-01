@@ -132,7 +132,7 @@ func TestAnUnaffordableHeadIsDroppedNotReposted(t *testing.T) {
 		e := &entry{tx: types.NewTx(&types.DynamicFeeTx{Nonce: n, Gas: 21_000, GasFeeCap: big.NewInt(1), To: &to, Value: zvm(32)}),
 			raw: make([]byte, 64), from: from, received: time.Now(), queuedAt: time.Now()}
 		s.queued[n] = e
-		r.byHash[e.tx.Hash()] = e
+		r.remember(e)
 		r.load[0]++
 	}
 	head := s.queued[179]

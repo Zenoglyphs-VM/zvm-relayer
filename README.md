@@ -75,3 +75,45 @@ hash acknowledgment without another publish, readiness while history is blocked,
 incomplete pages, changed frontiers/anchors and budget refusal. These controls do
 not establish durable queued admission, power-loss recovery, an authenticated
 wallet, live-chain execution or independent operator/maintainer acceptance.
+
+
+## Bounded admission profile
+
+Queued and posted transactions retain global and per-sender count/byte
+reservations until settlement or explicit queue expiry. Moving work into a
+posted batch does not free capacity. A refused replacement preserves the
+original signed bytes, hash and reservation. Recovery installs no partial state
+when its reconstructed queue would exceed the same admission limits.
+
+Finite defaults are 16,384 transactions, 64 MiB raw signed bytes, 4,096 senders,
+1,024 transactions and 4 MiB signed bytes per sender, a future nonce gap of
+4,096, 32 concurrent admissions and a five-second admission deadline. Zero
+selects the documented finite default. Configure limits before starting the
+service using the `--max-*` and `--admission-timeout` flags. Pending nonce calls
+share the admission slots. Head-account cache growth is also sender-bounded.
+
+HTTP POST capacity is reserved before reading a body. Health/status GETs remain
+available during congestion. The body cap is 8 MiB, a JSON-RPC batch contains
+1..100 requests, and the decoder stops before allocating the 101st request
+object. `--request-timeout` bounds the complete request, including a stalled
+socket body; its default is 15 seconds and its maximum is one minute. Capacity
+errors retain RPC code -32005; private upstream transport details are hidden.
+Historical nonce selectors retain the separately reviewed state/canonicality
+semantics. These limits do not turn volatile acknowledgment into durability or
+grant authority to sign, replace, change nonce/context or automatically resend.
+
+The proposed Linux resource job pins its Go image by digest and requires actual
+cgroup limits of 2 GiB memory, two CPUs and 128 tasks. It builds the production
+race-instrumented executable once for all recovery and admission scenarios.
+Three gapped bursts use 768 concurrent attempts plus 288 fresh-nonce fill
+requests, a 64 KiB retained-byte profile, 16 senders and four request/admission
+slots. Separate socket/posted-work checks verify readiness, typed refusal and
+slot release. The child has a 128 MiB Go soft memory target and a measured
+384 MiB RSS ceiling. Missing cgroup/RSS counters or any OOM event fail the lane.
+
+A separate 128-cycle component workload checks logical resource release and
+GC-assisted heap liveness against a warmed baseline while retaining its fixture
+input bytes. That GC-assisted result is not a production OS-RSS reclamation
+proof. The actual process profile reports kernel RSS independently. Operator
+limit selection, broader/default-scale workload/RSS, platform, power-loss,
+real-wallet/provider, NoM/finality and maintainer acceptance remain separate.
