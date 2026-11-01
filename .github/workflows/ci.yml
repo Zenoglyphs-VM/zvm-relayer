@@ -11,6 +11,7 @@ permissions:
 jobs:
   go:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,4 +23,30 @@ jobs:
 
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -json -count=1 -timeout=3m ./...
+      - run: go test -race -json -count=1 -timeout=5m ./...
+
+
+  node-routing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: edgepillar/zvm-node
+          ref: 86a254841276ede899b22379a9cdea4f9632465a
+          path: .ci/node
+          submodules: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .ci/node/go.mod
+      - name: Verify exact Node and Core sources
+        run: |
+          test "$(git -C .ci/node rev-parse HEAD)" = 86a254841276ede899b22379a9cdea4f9632465a
+          test "$(git -C .ci/node/zvm-core rev-parse HEAD)" = 29e6d9b30be94de3772c850c7a1e9811585a8833
+      - name: Install the declared CI-only consumer test overlay
+        run: cp integration/node_nonce_test.go.txt .ci/node/api/r03_nonce_consumer_test.go
+      - name: Qualify pinned production Node nonce routing
+        working-directory: .ci/node
+        run: go test -race -json -count=1 -timeout=3m -run '^TestHistoricalNonceRouting$' ./api

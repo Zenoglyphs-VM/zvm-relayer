@@ -1,0 +1,69 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+// This file is a CI-only test overlay on the pinned production Node source.
+// Historical selectors must reach the execution client unchanged, including
+// canonicality requests and its errors. Only pending belongs to the relayer.
+func TestHistoricalNonceRouting(t *testing.T) {
+	var clientCalls, relayCalls atomic.Int32
+	client := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientCalls.Add(1)
+		raw, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(raw)
+	}))
+	defer client.Close()
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		relayCalls.Add(1)
+		raw, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(raw)
+	}))
+	defer relay.Close()
+	s := &Server{cfg: Config{Relayer: relay.URL, EthURL: client.URL}}
+	handler := s.ethRPC(s.proxy(client.URL, ""))
+	hash := "0x" + strings.Repeat("01", 32)
+	for _, tc := range []struct{ name, ref string }{
+		{"earliest", `"earliest"`}, {"number", `"0x2"`}, {"latest", `"latest"`}, {"safe", `"safe"`}, {"finalized", `"finalized"`},
+		{"number_object", `{"blockNumber":"0x2"}`}, {"hash", `{"blockHash":"` + hash + `"}`},
+		{"canonical_hash", `{"blockHash":"` + hash + `","requireCanonical":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionCount","params":["0x0000000000000000000000000000000000000007",` + tc.ref + `]}`
+			before := clientCalls.Load()
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(body)))
+			if rr.Code != http.StatusOK || rr.Body.String() != body || clientCalls.Load() != before+1 || relayCalls.Load() != 0 {
+				t.Fatal("historical selector changed or was routed to queued state")
+			}
+		})
+	}
+	t.Run("mixed_batch_keeps_each_selector", func(t *testing.T) {
+		body := `[{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionCount","params":["0x0000000000000000000000000000000000000007","pending"]},{"jsonrpc":"2.0","id":2,"method":"eth_getTransactionCount","params":["0x0000000000000000000000000000000000000007",{"blockHash":"` + hash + `","requireCanonical":true}]}]`
+		before := clientCalls.Load()
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/rpc", strings.NewReader(body)))
+		var want, got []json.RawMessage
+		if json.Unmarshal([]byte(body), &want) != nil || json.Unmarshal(rr.Body.Bytes(), &got) != nil || len(got) != 2 || clientCalls.Load() != before+1 || relayCalls.Load() != 1 {
+			t.Fatal("mixed nonce batch routing failed")
+		}
+		for i := range want {
+			var a, b bytes.Buffer
+			_ = json.Compact(&a, want[i])
+			_ = json.Compact(&b, got[i])
+			if !bytes.Equal(a.Bytes(), b.Bytes()) {
+				t.Fatal("mixed nonce batch selector changed")
+			}
+		}
+	})
+}
