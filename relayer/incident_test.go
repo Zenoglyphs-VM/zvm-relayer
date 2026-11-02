@@ -6,6 +6,7 @@ package relayer
 // accounts spent the morning retrying publishes they had no plasma for.
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
@@ -310,11 +311,18 @@ func TestARestartAdoptsWhatIsInFlight(t *testing.T) {
 	if err := r.recoverInFlight(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(r.batches) != 1 || r.inFlight[0] != 1 {
-		t.Fatalf("adopted %d batches with %d in flight, want the one unconfirmed", len(r.batches), r.inFlight[0])
+	if len(r.batches) != 2 || r.inFlight[0] != 1 {
+		t.Fatalf("adopted %d batches with %d in flight, want the unconfirmed batch and the confirmed batch with an unused nonce", len(r.batches), r.inFlight[0])
 	}
 	if got := len(r.batches[0].entries); got != 2 {
 		t.Fatalf("adopted %d transactions, want nonces 5 and 6 (4 has landed)", got)
+	}
+	// NoM confirmation cannot consume nonce 9 when the canonical nonce is 5.
+	if r.nPosted != 3 || len(r.byHash) != 3 || r.batches[0].confirmed || !r.batches[1].confirmed ||
+		r.batches[0].entries[0].tx.Nonce() != 5 || r.batches[0].entries[1].tx.Nonce() != 6 ||
+		!bytes.Equal(r.batches[0].entries[0].raw, raws[1]) || !bytes.Equal(r.batches[0].entries[1].raw, raws[2]) ||
+		len(r.batches[1].entries) != 1 || r.batches[1].entries[0].tx.Nonce() != 9 || !bytes.Equal(r.batches[1].entries[0].raw, derived) {
+		t.Fatal("canonical used/unused nonces, confirmation tracking or exact bytes changed")
 	}
 	if r.capacity[0] != 105_000_000 {
 		t.Fatalf("capacity %d, want the account's max plasma read at startup", r.capacity[0])
