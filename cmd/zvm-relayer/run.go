@@ -6,14 +6,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/ethclient"
 
@@ -45,8 +43,42 @@ func runRelayer(args []string) error {
 	floorBP := fs.Uint64("footprint-floor-bp", relayer.DefaultFootprintFloorBP, "the smallest share of NoM this relayer will take, in basis points")
 	ceilingBP := fs.Uint64("footprint-ceiling-bp", relayer.DefaultFootprintCeilingBP, "the largest share of NoM this relayer will take, in basis points")
 	minTip := fs.Uint64("min-tip", relayer.DefaultMinTipWei, "smallest priority fee this relayer will carry, wei per gas (0: carry anything)")
+	recovery, err := recoveryFlags(fs)
+	if err != nil {
+		return err
+	}
+	admission := admissionStoreFlags(fs)
+	limits := relayer.DefaultLimits()
+	fs.IntVar(&limits.MaxTransactions, "max-transactions", limits.MaxTransactions, "maximum retained queued and posted transactions")
+	fs.Int64Var(&limits.MaxRawBytes, "max-raw-bytes", limits.MaxRawBytes, "maximum retained signed bytes")
+	fs.IntVar(&limits.MaxSenders, "max-senders", limits.MaxSenders, "maximum tracked senders and cached accounts")
+	fs.IntVar(&limits.MaxSenderTransactions, "max-sender-transactions", limits.MaxSenderTransactions, "maximum retained transactions per sender")
+	fs.Int64Var(&limits.MaxSenderRawBytes, "max-sender-raw-bytes", limits.MaxSenderRawBytes, "maximum retained signed bytes per sender")
+	fs.Uint64Var(&limits.MaxNonceGap, "max-nonce-gap", limits.MaxNonceGap, "maximum future nonce distance")
+	fs.IntVar(&limits.MaxConcurrent, "max-admission", limits.MaxConcurrent, "maximum concurrent admissions and HTTP body readers")
+	fs.DurationVar(&limits.AdmissionTimeout, "admission-timeout", limits.AdmissionTimeout, "deadline per transaction admission")
+	requestTimeout := fs.Duration("request-timeout", 15*time.Second, "deadline for the complete HTTP request including its body")
 	fs.Parse(args)
+	recoveryLimits, err := recovery.Checked()
+	if err != nil {
+		return err
+	}
+	resolved, err := limits.Resolve()
+	if err != nil {
+		return err
+	}
+	limits = resolved
+	if *requestTimeout <= 0 || *requestTimeout > time.Minute {
+		return errors.New("request timeout must be positive and at most one minute")
+	}
 
+	admissionLimits, err := admission.Checked()
+	if err != nil {
+		return err
+	}
+	if *accounts == 0 || *accounts > 128 {
+		return errors.New("relayer account count must be between 1 and 128")
+	}
 	cfg, err := rollup.Load(*configPath)
 	if err != nil {
 		return err
@@ -72,7 +104,9 @@ func runRelayer(args []string) error {
 		accts = append(accts, a)
 	}
 	rc := relayer.Config{
-		Rollup: cfg, L1: l1, Eth: eth, Accounts: accts,
+		Limits:   limits,
+		Recovery: recoveryLimits,
+		Rollup:   cfg, L1: l1, Eth: eth, Accounts: accts,
 		MaxWait: *maxWait, MaxInFlight: *maxInFlight,
 		QueueTTL: *queueTTL, MaxRequeues: *maxRequeues, MaxBatchGas: *maxBatchGas,
 		Log: slog.Default().With("svc", "relayer"),
@@ -85,23 +119,27 @@ func runRelayer(args []string) error {
 			rc.MinTip = new(big.Int).SetUint64(*minTip)
 		}
 	}
+	if admission.Directory != "" {
+		rc.AdmissionStore, err = relayer.OpenAdmissionStore(admission.Directory, rc, admissionLimits)
+		if err != nil {
+			return err
+		}
+		defer rc.AdmissionStore.Close()
+	}
 	r := relayer.New(rc)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, r.Snapshot())
 	})
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(w, "POST JSON-RPC here, or GET /status", http.StatusMethodNotAllowed)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		if !r.Ready() {
+			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(req.Body, 8<<20))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.Handle("/", relayBody(func(w http.ResponseWriter, req *http.Request, body []byte) {
 		serveJSONRPC(w, req.Context(), body, func(ctx context.Context, method string, params json.RawMessage) (any, *rpcError) {
 			switch method {
 			case "eth_sendRawTransaction":
@@ -115,11 +153,7 @@ func runRelayer(args []string) error {
 				}
 				hash, err := r.Submit(ctx, raw)
 				if err != nil {
-					var rej *relayer.RejectError
-					if errors.As(err, &rej) {
-						return nil, &rpcError{Code: -32000, Message: rej.Reason}
-					}
-					return nil, &rpcError{Code: -32603, Message: err.Error()}
+					return nil, relayAdmissionError(err)
 				}
 				return hash, nil
 			case "eth_getTransactionCount":
@@ -131,31 +165,7 @@ func runRelayer(args []string) error {
 				// replacement. That is what corrupted three steps of the
 				// 2026-09-16 benchmark matrix. `latest` stays the chain's own
 				// answer, so only a caller that asks for `pending` changes.
-				var ps []json.RawMessage
-				if err := json.Unmarshal(params, &ps); err != nil || len(ps) == 0 {
-					return nil, &rpcError{Code: -32602, Message: "expected an address and a block tag"}
-				}
-				var addrHex string
-				if err := json.Unmarshal(ps[0], &addrHex); err != nil || !common.IsHexAddress(addrHex) {
-					return nil, &rpcError{Code: -32602, Message: "expected an address"}
-				}
-				tag := "latest"
-				if len(ps) > 1 {
-					_ = json.Unmarshal(ps[1], &tag)
-				}
-				addr := common.HexToAddress(addrHex)
-				if tag != "pending" {
-					n, err := eth.NonceAt(ctx, addr, nil)
-					if err != nil {
-						return nil, &rpcError{Code: -32603, Message: err.Error()}
-					}
-					return hexutil.Uint64(n), nil
-				}
-				n, err := r.NextNonce(ctx, addr)
-				if err != nil {
-					return nil, &rpcError{Code: -32603, Message: err.Error()}
-				}
-				return hexutil.Uint64(n), nil
+				return transactionCount(ctx, params, eth, r.NextNonce)
 			case "eth_chainId":
 				return hexutil.Uint64(cfg.L2ChainID), nil
 			case "net_version":
@@ -164,8 +174,8 @@ func runRelayer(args []string) error {
 				return nil, &rpcError{Code: -32601, Message: "the relayer accepts eth_sendRawTransaction and eth_getTransactionCount; read other state from the ZVM RPC"}
 			}
 		})
-	})
-	srv := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	}))
+	srv := &http.Server{Addr: *listen, Handler: relayHTTPBudget(mux, limits.MaxConcurrent, *requestTimeout), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: time.Minute, WriteTimeout: time.Minute, IdleTimeout: 2 * time.Minute}
 	go func() {
 		<-ctx.Done()
 		shutdown, c := context.WithTimeout(context.Background(), 5*time.Second)
@@ -180,6 +190,22 @@ func runRelayer(args []string) error {
 		}
 	}()
 	return r.Run(ctx)
+}
+
+func relayAdmissionError(err error) *rpcError {
+	var capacity *relayer.CapacityError
+	if errors.As(err, &capacity) {
+		return &rpcError{Code: -32005, Message: capacity.Error()}
+	}
+	var rejected *relayer.RejectError
+	if errors.As(err, &rejected) {
+		return &rpcError{Code: -32000, Message: rejected.Reason}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &rpcError{Code: -32603, Message: "transaction admission timed out"}
+	}
+	// Transport errors can contain private upstream endpoints or credentials.
+	return &rpcError{Code: -32603, Message: "transaction admission is unavailable"}
 }
 
 type rpcError struct {
@@ -213,9 +239,9 @@ func serveJSONRPC(w http.ResponseWriter, ctx context.Context, body []byte,
 		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: res, Error: rerr}
 	}
 	if strings.HasPrefix(trimmed, "[") {
-		var reqs []rpcRequest
-		if err := json.Unmarshal(body, &reqs); err != nil {
-			writeJSON(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", ID: json.RawMessage("null"), Error: &rpcError{Code: -32700, Message: err.Error()}})
+		reqs, rejection := relayBatch(body)
+		if rejection != nil {
+			writeJSON(w, http.StatusOK, rpcResponse{JSONRPC: "2.0", ID: json.RawMessage("null"), Error: rejection})
 			return
 		}
 		out := make([]rpcResponse, len(reqs))

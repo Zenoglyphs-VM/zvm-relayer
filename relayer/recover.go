@@ -1,24 +1,188 @@
 package relayer
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
+	"io"
+	"math"
+	"net/http"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 
 	"github.com/Zenoglyphs-VM/zvm-core/derive"
 	"github.com/Zenoglyphs-VM/zvm-core/znn"
 )
 
-// recoverDepth is how far back each account's chain is read on startup for
-// batches still in flight. MaxInFlight blocks, some of them a batch in chunks
-// plus its assemble, fit well inside it.
-const recoverDepth = 64
+// RecoveryLimits bound a complete startup scan. Exceeding a limit refuses
+// startup; a recent suffix is never substituted for the declared account chain.
+// These limits cover this recovery reader, not the service's other RPC paths.
+type RecoveryLimits struct {
+	MaxBlocks             uint64
+	MaxCalls              int
+	MaxResponseBytes      int64
+	MaxTotalResponseBytes int64
+	MaxRawBytes           int64
+	MaxTransactions       int
+	MaxSenders            int
+	Timeout               time.Duration
+}
 
-// recovered is one batch block found on an account's chain at startup.
+// Checked resolves zero-valued fields to their defaults and validates every
+// independent bound. Zero never means unlimited; it retains the library default.
+func (l RecoveryLimits) Checked() (RecoveryLimits, error) { return l.checked() }
+
+// Stable errors distinguish which operator-selected response budget refused a
+// read without exposing an endpoint, a remote diagnostic or signed bytes.
+var (
+	ErrRecoveryResponseBytes      = errors.New("recovery single response byte limit exceeded")
+	ErrRecoveryTotalResponseBytes = errors.New("recovery total response byte limit exceeded")
+)
+
+func (l RecoveryLimits) checked() (RecoveryLimits, error) {
+	if l.MaxBlocks == 0 {
+		l.MaxBlocks = 65536
+	}
+	if l.MaxCalls == 0 {
+		l.MaxCalls = 8192
+	}
+	if l.MaxResponseBytes == 0 {
+		l.MaxResponseBytes = 2 << 20
+	}
+	if l.MaxTotalResponseBytes == 0 {
+		l.MaxTotalResponseBytes = 128 << 20
+	}
+	if l.MaxRawBytes == 0 {
+		l.MaxRawBytes = 64 << 20
+	}
+	if l.MaxTransactions == 0 {
+		l.MaxTransactions = 32768
+	}
+	if l.MaxSenders == 0 {
+		l.MaxSenders = 4096
+	}
+	if l.Timeout == 0 {
+		l.Timeout = 2 * time.Minute
+	}
+	if l.MaxBlocks > 16<<20 || l.MaxCalls < 1 || l.MaxCalls > 1<<20 ||
+		l.MaxResponseBytes < 1024 || l.MaxResponseBytes > 16<<20 ||
+		l.MaxTotalResponseBytes < l.MaxResponseBytes || l.MaxTotalResponseBytes > 1<<30 ||
+		l.MaxRawBytes < 1 || l.MaxRawBytes > 512<<20 ||
+		l.MaxTransactions < 1 || l.MaxTransactions > 1<<20 || l.MaxSenders < 1 || l.MaxSenders > 1<<20 ||
+		l.Timeout < time.Millisecond || l.Timeout > 30*time.Minute {
+		return l, errors.New("invalid recovery limits")
+	}
+	return l, nil
+}
+
+type recoveryReader struct {
+	limits        RecoveryLimits
+	client        *http.Client
+	endpoint      string
+	calls         int
+	responseBytes int64
+}
+
+func uniqueRecoveryEnvelope(raw []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return false
+	}
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		key, ok := token.(string)
+		if !ok || seen[key] || key != "jsonrpc" && key != "id" && key != "result" && key != "error" {
+			return false
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return false
+		}
+	}
+	token, err = decoder.Token()
+	if err != nil || token != json.Delim('}') {
+		return false
+	}
+	var extra any
+	return decoder.Decode(&extra) == io.EOF
+}
+
+// read uses a bounded body and an exact response envelope. Error text never
+// exports endpoint credentials, a remote diagnostic or signed transaction bytes.
+func (q *recoveryReader) read(ctx context.Context, out any, method string, params ...any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	remaining := q.limits.MaxTotalResponseBytes - q.responseBytes
+	if remaining <= 0 {
+		return ErrRecoveryTotalResponseBytes
+	}
+	cap := min(q.limits.MaxResponseBytes, remaining)
+	byteLimitError := ErrRecoveryResponseBytes
+	if remaining < q.limits.MaxResponseBytes {
+		byteLimitError = ErrRecoveryTotalResponseBytes
+	}
+	if q.calls >= q.limits.MaxCalls {
+		return errors.New("recovery RPC call limit exceeded")
+	}
+	q.calls++
+	if params == nil {
+		params = []any{}
+	}
+	request, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": q.calls, "method": method, "params": params})
+	if err != nil {
+		return errors.New("recovery request cannot be encoded")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, q.endpoint, bytes.NewReader(request))
+	if err != nil {
+		return errors.New("invalid recovery endpoint")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	response, err := q.client.Do(req)
+	if err != nil {
+		return errors.New("recovery RPC transport failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return errors.New("recovery RPC HTTP status refused")
+	}
+	if response.ContentLength > cap {
+		return byteLimitError
+	}
+	raw, err := io.ReadAll(io.LimitReader(response.Body, cap+1))
+	q.responseBytes += int64(len(raw))
+	if int64(len(raw)) > cap {
+		return byteLimitError
+	}
+	if err != nil {
+		return errors.New("recovery response incomplete")
+	}
+	var envelope struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      int             `json:"id"`
+		Result  json.RawMessage `json:"result"`
+		Error   json.RawMessage `json:"error"`
+	}
+	if !uniqueRecoveryEnvelope(raw) || json.Unmarshal(raw, &envelope) != nil || envelope.JSONRPC != "2.0" || envelope.ID != q.calls ||
+		len(envelope.Result) == 0 || len(envelope.Error) != 0 && !bytes.Equal(bytes.TrimSpace(envelope.Error), []byte("null")) {
+		return errors.New("recovery RPC envelope refused")
+	}
+	if err := json.Unmarshal(envelope.Result, out); err != nil {
+		return errors.New("recovery RPC result refused")
+	}
+	return nil
+}
+
 type recovered struct {
 	shard   int
 	block   *znn.AccountBlock
@@ -28,197 +192,357 @@ type recovered struct {
 	senders []common.Address
 }
 
-// recoverInFlight adopts the batches this relayer's accounts posted before it
-// last stopped whose transactions have not been derived yet, and reads each
-// account's plasma so that pickShard is weighted from the first submission.
-//
-// The relayer keeps nothing on disk, so a restart used to forget what it had in
-// flight. Wallets and the bench resubmit whatever they have not seen land; the
-// relayer knew nothing of the hash and posted it again while the first copy was
-// still on its way, and one of the two was then dropped as "nonce too low". On
-// 2026-09-22 the re-post spikes on chain 69 came soon after two restarts.
-// Adopted, these batches are tracked and settled like any other, and a
-// resubmission is answered from byHash.
-func (r *Relayer) recoverInFlight(ctx context.Context) error {
-	for shard, acct := range r.cfg.Accounts {
-		if info, err := r.cfg.L1.PlasmaInfo(ctx, acct.Address()); err == nil {
-			r.mu.Lock()
-			r.capacity[shard] = info.MaxPlasma
-			r.mu.Unlock()
+func (r *Relayer) recoveryBlock(b *znn.AccountBlock, addr znn.Address) error {
+	if b == nil || b.Address != addr || b.Height == 0 || b.ChainIdentifier != r.cfg.Rollup.L1ChainID ||
+		b.Hash == (znn.Hash{}) || len(b.Data) > znn.MaxDataLength || len(b.DescendantBlocks) > 1024 {
+		return errors.New("recovery account block identity or contents refused")
+	}
+	if amount := b.Amount.Big(); amount.Sign() < 0 || amount.BitLen() > 256 {
+		return errors.New("recovery account amount refused")
+	}
+	for _, descendant := range b.DescendantBlocks {
+		if descendant == nil {
+			return errors.New("recovery descendant refused")
 		}
 	}
+	if b.Hash != b.ComputeHash() {
+		return errors.New("recovery account block hash refused")
+	}
+	if b.ConfirmationDetail != nil && b.ConfirmationDetail.MomentumHeight == 0 {
+		return errors.New("recovery confirmation height refused")
+	}
+	return nil
+}
 
-	l2Head, err := r.cfg.Eth.BlockNumber(ctx)
+func (r *Relayer) recoveryPayload(ctx context.Context, q *recoveryReader, b *znn.AccountBlock, seen map[znn.Hash]uint64) ([]byte, error) {
+	if b.ToAddress != r.cfg.Rollup.Inbox || len(b.Data) == 0 {
+		return nil, nil
+	}
+	switch b.Data[0] {
+	case derive.MsgBatch:
+		if len(b.Data) > r.cfg.Rollup.MaxAssembledBytes {
+			return nil, errors.New("recovery batch exceeds assembled byte limit")
+		}
+		return b.Data[1:], nil
+	case derive.MsgAssemble:
+		hashes, err := derive.DecodeAssemble(b.Data[1:])
+		if err != nil {
+			return nil, errors.New("recovery assembly refused")
+		}
+		var joined []byte
+		unique := map[znn.Hash]bool{}
+		for _, hash := range hashes {
+			height, ok := seen[hash]
+			if !ok || height >= b.Height || unique[hash] {
+				return nil, errors.New("recovery assembly is not bound to earlier account history")
+			}
+			unique[hash] = true
+			var chunk *znn.AccountBlock
+			if err := q.read(ctx, &chunk, "ledger.getAccountBlockByHash", hash); err != nil {
+				return nil, err
+			}
+			if err := r.recoveryBlock(chunk, b.Address); err != nil {
+				return nil, err
+			}
+			if chunk.Hash != hash || chunk.Height != height || chunk.ToAddress != r.cfg.Rollup.Inbox || len(chunk.Data) < 2 || chunk.Data[0] != derive.MsgChunk ||
+				len(chunk.Data)-1 > r.cfg.Rollup.MaxAssembledBytes-len(joined) {
+				return nil, errors.New("recovery chunk missing, changed or over byte limit")
+			}
+			joined = append(joined, chunk.Data[1:]...)
+		}
+		if len(joined) == 0 || joined[0] != derive.MsgBatch {
+			return nil, errors.New("recovery assembly is not a batch")
+		}
+		return joined[1:], nil
+	}
+	return nil, nil
+}
+
+// recoverInFlight scans every configured account from height one to a frozen
+// frontier, pins execution nonces to one canonical hash, and stages everything
+// before changing live state. Configured RPC consistency is not finality proof.
+func (r *Relayer) recoverInFlight(parent context.Context) error {
+	limits, err := r.cfg.Recovery.checked()
 	if err != nil {
 		return err
 	}
-	var found []*recovered
-	for shard, acct := range r.cfg.Accounts {
-		fs, err := r.inFlightOn(ctx, shard, acct.Address(), l2Head)
-		if err != nil {
-			return fmt.Errorf("account %d (%s): %w", shard, acct.Address(), err)
+	if r.cfg.Rollup == nil || r.cfg.L1 == nil || r.cfg.Eth == nil || len(r.cfg.Accounts) == 0 || len(r.cfg.Accounts) > 128 ||
+		r.cfg.Rollup.L1ChainID == 0 || r.cfg.Rollup.L2ChainID == 0 || r.cfg.Rollup.L1StartHeight == 0 || r.cfg.Rollup.MaxBatchBytes < 1 ||
+		r.cfg.Rollup.MaxBatchBytes > 64<<20 || r.cfg.Rollup.MaxAssembledBytes < 1 || r.cfg.Rollup.MaxAssembledBytes > 64<<20 {
+		return errors.New("incomplete recovery configuration")
+	}
+	ctx, cancel := context.WithTimeout(parent, limits.Timeout)
+	defer cancel()
+	journal, err := r.cfg.AdmissionStore.records()
+	if err != nil {
+		return err
+	}
+	q := &recoveryReader{limits: limits, client: &http.Client{Timeout: limits.Timeout}, endpoint: r.cfg.L1.URL()}
+	chainID, err := r.cfg.Eth.ChainID(ctx)
+	if err != nil || chainID == nil || chainID.Cmp(r.cfg.Rollup.L2ChainIDBig()) != 0 {
+		return errors.New("recovery execution chain identity refused")
+	}
+	anchor, err := r.cfg.Eth.HeaderByNumber(ctx, nil)
+	if err != nil || anchor == nil || anchor.Number == nil || !anchor.Number.IsUint64() {
+		return errors.New("recovery execution anchor unavailable")
+	}
+	if r.cfg.Rollup.L2GenesisHash != (common.Hash{}) {
+		genesis, err := r.cfg.Eth.HeaderByNumber(ctx, common.Big0)
+		if err != nil || genesis == nil || genesis.Hash() != r.cfg.Rollup.L2GenesisHash {
+			return errors.New("recovery execution genesis refused")
 		}
-		found = append(found, fs...)
 	}
-	if len(found) == 0 {
-		return nil
+	type fence struct {
+		address znn.Address
+		block   *znn.AccountBlock
 	}
-
-	// Each sender's nonce at the head: a transaction below it has landed, or
-	// lost its nonce to another, and is not in flight whatever its block says.
+	var fences []fence
+	var found []*recovered
+	capacities := make([]uint64, len(r.cfg.Accounts))
+	addresses := map[znn.Address]bool{}
+	senders := map[common.Address]bool{}
 	nonces := map[common.Address]uint64{}
-	for _, f := range found {
-		for _, from := range f.senders {
-			if _, ok := nonces[from]; ok {
-				continue
+	selector := map[string]any{"blockHash": anchor.Hash(), "requireCanonical": true}
+	// Cache one nonce per sender at the frozen canonical execution hash.
+	// NoM confirmation metadata cannot prove that an EVM nonce was used.
+	canonicalNonce := func(from common.Address) (uint64, error) {
+		if nonce, known := nonces[from]; known {
+			return nonce, nil
+		}
+		if !senders[from] {
+			if len(senders) >= limits.MaxSenders {
+				return 0, errors.New("recovery sender limit exceeded")
 			}
-			_, a, err := r.headFor(ctx, from)
-			if err != nil {
+			senders[from] = true
+		}
+		var nonce hexutil.Uint64
+		if err := r.cfg.Eth.Client().CallContext(ctx, &nonce, "eth_getTransactionCount", from, selector); err != nil {
+			return 0, errors.New("recovery canonical nonce unavailable")
+		}
+		nonces[from] = uint64(nonce)
+		return uint64(nonce), nil
+	}
+	for _, record := range journal {
+		_, from, err := r.admissionTransaction(record)
+		if err != nil {
+			return err
+		}
+		senders[from] = true
+		if len(senders) > limits.MaxSenders {
+			return errors.New("recovery sender limit exceeded")
+		}
+	}
+	var blocks uint64
+	var rawBytes int64
+	transactions := 0
+	for shard, account := range r.cfg.Accounts {
+		if account == nil || addresses[account.Address()] {
+			return errors.New("duplicate or missing recovery account")
+		}
+		addr := account.Address()
+		addresses[addr] = true
+		var plasma znn.PlasmaInfo
+		if err := q.read(ctx, &plasma, "embedded.plasma.get", addr); err != nil {
+			return err
+		}
+		capacities[shard] = plasma.MaxPlasma
+		var front *znn.AccountBlock
+		if err := q.read(ctx, &front, "ledger.getFrontierAccountBlock", addr); err != nil {
+			return err
+		}
+		fences = append(fences, fence{addr, front})
+		if front == nil {
+			continue
+		}
+		if err := r.recoveryBlock(front, addr); err != nil {
+			return err
+		}
+		if front.Height > limits.MaxBlocks-blocks {
+			return errors.New("complete recovery account history exceeds block limit")
+		}
+		seen := make(map[znn.Hash]uint64)
+		var previous znn.Hash
+		for from := uint64(1); from <= front.Height; {
+			if err := ctx.Err(); err != nil {
 				return err
 			}
-			nonces[from] = a.nonce
+			count := min(uint64(64), front.Height-from+1)
+			var page *znn.BlockList
+			if err := q.read(ctx, &page, "ledger.getAccountBlocksByHeight", addr, from, count); err != nil {
+				return err
+			}
+			// go-zenon's count is the full frontier height, not page length.
+			if page == nil || page.Count != front.Height || page.More || uint64(len(page.List)) != count {
+				return errors.New("incomplete or changed recovery page")
+			}
+			for i, block := range page.List {
+				if err := r.recoveryBlock(block, addr); err != nil {
+					return err
+				}
+				if block.Height != from+uint64(i) || block.PreviousHash != previous || seen[block.Hash] != 0 {
+					return errors.New("recovery account history is not contiguous")
+				}
+				previous = block.Hash
+				seen[block.Hash] = block.Height
+				blocks++
+				payload, err := r.recoveryPayload(ctx, q, block, seen)
+				if err != nil {
+					return err
+				}
+				if payload == nil {
+					continue
+				}
+				raws, err := derive.DecodeBatch(payload, r.cfg.Rollup.MaxBatchBytes, true)
+				if err != nil {
+					return errors.New("unresolved recovery batch cannot be decoded")
+				}
+				item := &recovered{shard: shard, block: block, bytes: len(payload) + 1}
+				for _, raw := range raws {
+					tx := new(types.Transaction)
+					if tx.UnmarshalBinary(raw) != nil || tx.Protected() && tx.ChainId().Cmp(r.cfg.Rollup.L2ChainIDBig()) != 0 {
+						return errors.New("recovery transaction identity refused")
+					}
+					sender, err := types.Sender(r.signer, tx)
+					if err != nil {
+						return errors.New("recovery transaction signature refused")
+					}
+					nonce, err := canonicalNonce(sender)
+					if err != nil {
+						return err
+					}
+					if tx.Nonce() < nonce {
+						continue
+					}
+					// Charge retained limits and copy bytes only for unused nonces.
+					rawBytes += int64(len(raw))
+					transactions++
+					if rawBytes > limits.MaxRawBytes || transactions > limits.MaxTransactions {
+						return errors.New("recovery transaction retention limit exceeded")
+					}
+					item.txs = append(item.txs, tx)
+					item.raws = append(item.raws, bytes.Clone(raw))
+					item.senders = append(item.senders, sender)
+				}
+				if len(item.txs) > 0 {
+					found = append(found, item)
+				}
+			}
+			from += count
+		}
+		if previous != front.Hash {
+			return errors.New("recovery history does not reach its frozen frontier")
 		}
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	now := time.Now()
-	var batches, txs int
-	for _, f := range found {
-		b := &batch{shard: f.shard, block: f.block.Hash, height: f.block.Height, published: now, bytes: f.bytes}
-		if d := f.block.ConfirmationDetail; d != nil {
-			b.confirmed, b.momentum = true, d.MomentumHeight
+	for sender := range senders {
+		if _, err := canonicalNonce(sender); err != nil {
+			return err
 		}
-		for i, tx := range f.txs {
-			from, n := f.senders[i], tx.Nonce()
-			if r.byHash[tx.Hash()] != nil || n < nonces[from] {
+	}
+	for _, saved := range fences {
+		var actual *znn.AccountBlock
+		if err := q.read(ctx, &actual, "ledger.getFrontierAccountBlock", saved.address); err != nil {
+			return err
+		}
+		if (actual == nil) != (saved.block == nil) {
+			return errors.New("recovery account frontier changed")
+		}
+		if actual != nil {
+			if err := r.recoveryBlock(actual, saved.address); err != nil {
+				return err
+			}
+			if actual.Hash != saved.block.Hash || actual.Height != saved.block.Height {
+				return errors.New("recovery account frontier changed")
+			}
+		}
+	}
+	current, err := r.cfg.Eth.HeaderByNumber(ctx, anchor.Number)
+	if err != nil || current == nil || current.Hash() != anchor.Hash() {
+		return errors.New("recovery execution anchor changed")
+	}
+	staged := &Relayer{senders: map[common.Address]*sender{}, byHash: map[common.Hash]*entry{},
+		byShard: make([]map[common.Address]*sender, len(r.cfg.Accounts)), load: make([]int, len(r.cfg.Accounts)),
+		inFlight: make([]int, len(r.cfg.Accounts)), capacity: capacities}
+	for i := range staged.byShard {
+		staged.byShard[i] = map[common.Address]*sender{}
+	}
+	now := time.Now()
+	return r.installRecovery(ctx, staged, found, nonces, now, journal...)
+}
+
+// installRecovery constructs the complete replacement before taking the lock;
+// a failed late account, nonce or collision check preserves all live maps.
+func (r *Relayer) installRecovery(ctx context.Context, staged *Relayer, found []*recovered, nonces map[common.Address]uint64, now time.Time, journal ...admissionRecord) error {
+	limits, err := r.cfg.Limits.checked()
+	if err != nil {
+		return err
+	}
+	for _, item := range found {
+		b := &batch{shard: item.shard, block: item.block.Hash, height: item.block.Height, published: now, bytes: item.bytes}
+		if detail := item.block.ConfirmationDetail; detail != nil {
+			b.confirmed, b.momentum = true, detail.MomentumHeight
+		}
+		for i, tx := range item.txs {
+			from, nonce := item.senders[i], tx.Nonce()
+			if nonce < nonces[from] {
 				continue
 			}
-			s := r.senders[from]
+			if err := staged.checkCapacity(limits, from, len(item.raws[i]), nil); err != nil {
+				return err
+			}
+			s := staged.senders[from]
 			if s == nil {
-				s = &sender{addr: from, shard: f.shard, next: nonces[from],
-					queued: map[uint64]*entry{}, posted: map[uint64]*entry{}}
-				r.senders[from] = s
-				r.byShard[f.shard][from] = s
+				s = &sender{addr: from, shard: item.shard, next: nonces[from], queued: map[uint64]*entry{}, posted: map[uint64]*entry{}}
+				staged.senders[from] = s
+				staged.byShard[item.shard][from] = s
 			}
-			if s.posted[n] != nil {
-				continue
+			if staged.byHash[tx.Hash()] != nil || s.posted[nonce] != nil || s.shard != item.shard {
+				return errors.New("ambiguous recovered sender nonce or transaction")
 			}
-			e := &entry{tx: tx, raw: f.raws[i], from: from, received: now, queuedAt: now, state: posted, batch: b}
-			s.posted[n] = e
+			if tx.Gas() > math.MaxUint64-s.postedGas {
+				return errors.New("recovery gas total overflow")
+			}
+			e := &entry{tx: tx, raw: item.raws[i], from: from, received: now, queuedAt: now, state: posted, batch: b}
+			s.posted[nonce] = e
 			s.postedGas += tx.Gas()
 			s.lastUse = now
-			r.byHash[tx.Hash()] = e
-			r.nPosted++
-			r.load[s.shard]++
+			staged.remember(e)
+			staged.nPosted++
+			staged.load[item.shard]++
 			b.entries = append(b.entries, e)
 		}
 		if len(b.entries) == 0 {
 			continue
 		}
-		r.batches = append(r.batches, b)
+		staged.batches = append(staged.batches, b)
 		if !b.confirmed {
-			r.inFlight[f.shard]++
+			staged.inFlight[item.shard]++
 		}
-		batches++
-		txs += len(b.entries)
 	}
-	for _, s := range r.senders {
+	admissionRecords, err := r.mergeAdmissionRecovery(staged, journal, nonces, now)
+	if err != nil {
+		return err
+	}
+	for _, s := range staged.senders {
 		s.settleCursor(0)
 	}
-	r.cfg.Log.Info("adopted batches still in flight from before this start", "batches", batches, "txs", txs)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.byHash) != 0 || len(r.senders) != 0 || len(r.batches) != 0 {
+		return errors.New("recovery requires an empty startup lane")
+	}
+	if err := r.persistAdmissions(admissionRecords); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.senders, r.byHash, r.byShard, r.batches = staged.senders, staged.byHash, staged.byShard, staged.batches
+	r.load, r.inFlight, r.capacity, r.nPosted = staged.load, staged.inFlight, staged.capacity, staged.nPosted
+	r.nQueued = staged.nQueued
+	r.retainedBytes = staged.retainedBytes
+	r.cfg.Log.Info("complete account history recovery finished", "batches", len(r.batches), "transactions", r.nPosted)
 	return nil
-}
-
-// inFlightOn reads the last recoverDepth blocks of one account and returns the
-// batches among them whose momentum has not been derived yet.
-func (r *Relayer) inFlightOn(ctx context.Context, shard int, addr znn.Address, l2Head uint64) ([]*recovered, error) {
-	front, err := r.cfg.L1.FrontierAccountBlock(ctx, addr)
-	if err != nil {
-		return nil, err
-	}
-	if front == nil || front.Height == 0 {
-		return nil, nil
-	}
-	from := uint64(1)
-	if front.Height > recoverDepth {
-		from = front.Height - recoverDepth + 1
-	}
-	list, err := r.cfg.L1.AccountBlocksByHeight(ctx, addr, from, front.Height-from+1)
-	if err != nil {
-		return nil, err
-	}
-	if list == nil {
-		return nil, nil
-	}
-	var out []*recovered
-	for _, blk := range list.List {
-		if blk == nil || blk.ToAddress != r.cfg.Rollup.Inbox || len(blk.Data) == 0 {
-			continue
-		}
-		if d := blk.ConfirmationDetail; d != nil && l2Head >= r.cfg.Rollup.L2BlockForMomentum(d.MomentumHeight) {
-			continue // derived already: settled one way or the other
-		}
-		payload, err := r.batchPayload(ctx, blk)
-		if err != nil {
-			r.cfg.Log.Warn("reading a batch at startup", "shard", shard, "block", blk.Hash, "err", err)
-			continue
-		}
-		if payload == nil {
-			continue
-		}
-		raws, err := derive.DecodeBatch(payload, r.cfg.Rollup.MaxBatchBytes, true)
-		if err != nil {
-			r.cfg.Log.Warn("decoding a batch at startup", "shard", shard, "block", blk.Hash, "err", err)
-			continue
-		}
-		f := &recovered{shard: shard, block: blk, bytes: len(payload) + 1}
-		for _, raw := range raws {
-			tx := new(types.Transaction)
-			if tx.UnmarshalBinary(raw) != nil {
-				continue
-			}
-			sender, err := types.Sender(r.signer, tx)
-			if err != nil {
-				continue
-			}
-			f.txs, f.raws, f.senders = append(f.txs, tx), append(f.raws, raw), append(f.senders, sender)
-		}
-		if len(f.txs) > 0 {
-			out = append(out, f)
-		}
-	}
-	return out, nil
-}
-
-// batchPayload returns what follows the batch type byte in a block's message:
-// the block's own data for a batch, the joined chunks for an assemble of one,
-// and nil for anything else — a chunk on its own is carried by the assemble
-// that names it.
-func (r *Relayer) batchPayload(ctx context.Context, blk *znn.AccountBlock) ([]byte, error) {
-	switch blk.Data[0] {
-	case derive.MsgBatch:
-		return blk.Data[1:], nil
-	case derive.MsgAssemble:
-		hashes, err := derive.DecodeAssemble(blk.Data[1:])
-		if err != nil {
-			return nil, err
-		}
-		var joined []byte
-		for _, h := range hashes {
-			c, err := r.cfg.L1.AccountBlockByHash(ctx, h)
-			if err != nil {
-				return nil, err
-			}
-			if c == nil || len(c.Data) == 0 || c.Data[0] != derive.MsgChunk {
-				return nil, errors.New("chunk " + h.String() + " is missing")
-			}
-			joined = append(joined, c.Data[1:]...)
-		}
-		if len(joined) == 0 || joined[0] != derive.MsgBatch {
-			return nil, nil
-		}
-		return joined[1:], nil
-	}
-	return nil, nil
 }
