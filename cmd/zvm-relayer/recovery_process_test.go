@@ -223,8 +223,8 @@ type recoveryOwnedProcess struct {
 	url      string
 }
 
-func (f *recoveryProcessFixture) start(binary string, blocks string) *recoveryOwnedProcess {
-	return f.startWithRecoveryFlags(binary, blocks)
+func (f *recoveryProcessFixture) start(binary string, blocks string, extra ...string) *recoveryOwnedProcess {
+	return f.startWithRecoveryFlags(binary, blocks, extra...)
 }
 
 func (f *recoveryProcessFixture) startWithRecoveryFlags(binary string, blocks string, recoveryArgs ...string) *recoveryOwnedProcess {
@@ -251,6 +251,9 @@ func (f *recoveryProcessFixture) startWithRecoveryFlags(binary string, blocks st
 	p.command = exec.Command(binary, "relayer", "-config", config, "-l1", f.l1.URL, "-eth", f.eth.URL, "-listen", listen, "-accounts", "1", "-first-index", "202", "-footprint=false", "-max-wait", "1h", "-recovery-timeout", "5s", "-recovery-max-blocks", blocks)
 	p.command.Args = append(p.command.Args, recoveryArgs...)
 	p.command.Env = []string{"PATH=" + os.Getenv("PATH"), "LANG=C", "TZ=UTC", "GORACE=halt_on_error=1"}
+	if limit := os.Getenv("ZVM_RELAYER_PROFILE_GOMEMLIMIT"); limit != "" {
+		p.command.Env = append(p.command.Env, "GOMEMLIMIT="+limit)
+	}
 	p.command.Stdout = p.output
 	p.command.Stderr = p.output
 	if err = p.command.Start(); err != nil {

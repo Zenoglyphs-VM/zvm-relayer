@@ -30,18 +30,44 @@ jobs:
   recovery-process:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    container:
+      image: docker.io/library/golang@sha256:ebd54034f076819b3054f155db53660ded951612bb4dfd277f933e62059e5d5a
+      options: --memory=2g --cpus=2 --pids-limit=128
+    env:
+      GOMAXPROCS: '2'
+      GOMEMLIMIT: 512MiB
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: Verify original public Core pin
-        run: test "$(git -C zvm-core rev-parse HEAD)" = 29e6d9b30be94de3772c850c7a1e9811585a8833
-      - name: Build the actual production relayer with race instrumentation
+      - name: Scope Git access to the exact container checkout
+        run: |
+          test -n "$GITHUB_WORKSPACE"
+          test "$PWD" = "$GITHUB_WORKSPACE"
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=safe.directory
+          export GIT_CONFIG_VALUE_0="$GITHUB_WORKSPACE"
+          export GIT_CONFIG_KEY_1=safe.directory
+          export GIT_CONFIG_VALUE_1="$GITHUB_WORKSPACE/zvm-core"
+          test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
+          test -z "$(git status --porcelain)"
+          test -z "$(git -C zvm-core status --porcelain)"
+          printf '%s\n' "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT" "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0" "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0" "GIT_CONFIG_KEY_1=$GIT_CONFIG_KEY_1" "GIT_CONFIG_VALUE_1=$GIT_CONFIG_VALUE_1" >> "$GITHUB_ENV"
+      - name: Verify the pinned Go toolchain and original Core source
+        run: |
+          go version
+          test "$(go version)" = "go version go1.25.0 linux/amd64"
+          test "$(git -C zvm-core rev-parse HEAD)" = 29e6d9b30be94de3772c850c7a1e9811585a8833
+      - name: Build the actual production relayer with race instrumentation once
         run: go build -race -o "$RUNNER_TEMP/zvm-relayer-recovery" ./cmd/zvm-relayer
-      - name: Qualify complete history and volatile or synchronous local admission in real processes
+      - name: Verify the embedded production source revision
+        run: |
+          relayer_build_metadata="$(go version -m "$RUNNER_TEMP/zvm-relayer-recovery")"
+          printf '%s\n' "$relayer_build_metadata"
+          printf '%s\n' "$relayer_build_metadata" | grep -F "vcs.revision=$(git rev-parse HEAD)"
+          printf '%s\n' "$relayer_build_metadata" | grep -F 'vcs.modified=false'
+      - name: Qualify bounded volatile and durable admission with complete recovery in actual processes
         env:
           ZVM_RELAYER_RECOVERY_BINARY: ${{ runner.temp }}/zvm-relayer-recovery
-        run: go test -race -json -count=1 -timeout=3m -run '^Test(RecoveryCLIProcesses|DurableAdmissionCLIProcesses|DurablePublicationCLIProcesses|CanonicalRecoveryCLIProcesses)$' ./cmd/zvm-relayer
+          ZVM_RELAYER_PROFILE_GOMEMLIMIT: 128MiB
+        run: go test -race -json -count=1 -timeout=3m -run '^Test(RecoveryCLIProcesses|DurableAdmissionCLIProcesses|DurablePublicationCLIProcesses|CanonicalRecoveryCLIProcesses|AdmissionResourceCLI|BoundedDurableAdmissionCLI)$' ./cmd/zvm-relayer

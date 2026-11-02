@@ -243,6 +243,10 @@ func (r *Relayer) mergeAdmissionRecovery(staged *Relayer, journal []admissionRec
 	if r.cfg.AdmissionStore == nil {
 		return nil, nil
 	}
+	limits, err := r.cfg.Limits.checked()
+	if err != nil {
+		return nil, err
+	}
 	var retired []admissionRecord
 	for _, record := range journal {
 		tx, from, err := r.admissionTransaction(record)
@@ -269,6 +273,12 @@ func (r *Relayer) mergeAdmissionRecovery(staged *Relayer, journal []admissionRec
 			return nil, ErrAdmissionPublicationUnknown
 		}
 		s := staged.senders[from]
+		if s != nil && (s.queued[tx.Nonce()] != nil || s.posted[tx.Nonce()] != nil) {
+			return nil, ErrAdmissionPublicationUnknown
+		}
+		if err := staged.checkCapacity(limits, from, len(record.raw), nil); err != nil {
+			return nil, err
+		}
 		if s == nil {
 			if int(record.shard) >= len(staged.byShard) {
 				return nil, ErrAdmissionStoreUnavailable
@@ -283,7 +293,7 @@ func (r *Relayer) mergeAdmissionRecovery(staged *Relayer, journal []admissionRec
 		e := &entry{tx: tx, raw: bytes.Clone(record.raw), from: from, received: record.received, queuedAt: record.queuedAt, requeues: int(record.requeues)}
 		s.queued[tx.Nonce()] = e
 		s.lastUse = now
-		staged.byHash[record.hash] = e
+		staged.remember(e)
 		staged.nQueued++
 		staged.load[s.shard]++
 	}
