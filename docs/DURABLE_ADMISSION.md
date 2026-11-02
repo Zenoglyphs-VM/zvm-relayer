@@ -53,3 +53,14 @@ race-instrumented CLI acknowledgement/kill/reopen cases. Controlled fixtures do
 not establish real wallet integration, independent crash acceptance, supported
 platform/hardware behavior, NoM authority/finality or production readiness.
 Every original R02 and roadmap acceptance gate remains active.
+
+The dedicated production CLI lane also exercises the actual signed account-block
+HTTP publication boundary against an owned loopback endpoint. It distinguishes a
+publication absent from source history, an accepted publication whose response is
+withheld, and an acknowledged publication. After a kernel kill it reads the real
+store, requires an unresolved intent to hold readiness, or recovers the exact
+posted hash from complete history without a second publication. Concurrent
+replacement is refused while the original publication is outstanding. The
+fixture checks the public development account signature and exact carried
+transaction bytes; this controlled signature check does not authenticate a live
+NoM provider or establish canonicality/finality, wallet or power-loss acceptance.

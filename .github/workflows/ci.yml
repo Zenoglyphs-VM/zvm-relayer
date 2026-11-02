@@ -44,4 +44,4 @@ jobs:
       - name: Qualify complete history and volatile or synchronous local admission in real processes
         env:
           ZVM_RELAYER_RECOVERY_BINARY: ${{ runner.temp }}/zvm-relayer-recovery
-        run: go test -race -json -count=1 -timeout=3m -run '^Test(RecoveryCLIProcesses|DurableAdmissionCLIProcesses)$' ./cmd/zvm-relayer
+        run: go test -race -json -count=1 -timeout=3m -run '^Test(RecoveryCLIProcesses|DurableAdmissionCLIProcesses|DurablePublicationCLIProcesses)$' ./cmd/zvm-relayer
