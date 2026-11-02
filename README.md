@@ -56,8 +56,11 @@ refuse startup. A recent suffix never counts as complete recovery. The configure
 RPCs remain trust dependencies; these consistency checks are not an independent
 NoM/execution-client finality or release-epoch attestation.
 
-`/health` returns 503 until recovery completes, and `/status` exposes `ready`,
-`recoveryStatus`, `admissionMode: "volatile"` and `admissionDurable: false`.
+`/health` returns 503 until recovery completes, and `/status` exposes `ready`
+and `recoveryStatus`. The default mode reports `admissionMode: "volatile"` and
+`admissionDurable: false`. Selecting `--admission-store` enables optional local
+synchronous retention; see [the local storage contract](docs/DURABLE_ADMISSION.md)
+for lifecycle, limits, uncertainty and migration boundaries.
 Every recovery-reader budget is operator-configurable: block count, timeout,
 L1 calls, individual and total response bytes, retained signed bytes,
 transactions and senders. See the startup budget table below.
@@ -68,13 +71,24 @@ decision; startup does not silently increase a limit or admit from partial data.
 The ordinary service/ETH RPC paths and workload/RSS limits remain separate R01
 qualification requirements.
 
-The Linux process CI lane uses the actual race-instrumented relayer executable,
-read-only loopback RPC fixtures and synthetic signed transactions. It checks a
-batch outside the old 64-block suffix, a forced process stop/restart, original
-hash acknowledgment without another publish, readiness while history is blocked,
-incomplete pages, changed frontiers/anchors and budget refusal. These controls do
-not establish durable queued admission, power-loss recovery, an authenticated
-wallet, live-chain execution or independent operator/maintainer acceptance.
+The Linux process CI lane uses the actual race-instrumented relayer executable
+and controlled loopback RPC fixtures. It checks complete history, readiness and
+budgets, volatile or local-sync acknowledgement, exclusive storage ownership,
+original-hash kernel-kill/reopen, and signed-publication uncertainty. The original
+zero-write fixtures remain read-only; the publication controls write only to an
+owned loopback endpoint using a public development account. These controls do not
+establish live-chain authority/finality, an authenticated production wallet,
+hardware power-loss behavior or independent operator/maintainer acceptance.
+
+A NoM confirmation annotation does not prove EVM execution. Recovery validates
+every decoded signed transaction and reads one cached nonce per sender at the
+frozen canonical execution hash. Unused nonces keep their exact bytes regardless
+of that annotation. Already-used nonces are discarded before pending raw-byte
+and entry retention budgets or copies. Historical senders still consume the
+checked sender budget; all source pages, response bytes, decoding and elapsed
+work remain bounded. Malformed historical batches remain refused rather than
+being hidden by a confirmation annotation. This introduces no persisted settled
+checkpoint, unbounded-history recovery or measured RSS/elapsed improvement.
 
 ### Selecting startup recovery budgets
 

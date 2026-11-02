@@ -302,6 +302,26 @@ func (r *Relayer) recoverInFlight(parent context.Context) error {
 	addresses := map[znn.Address]bool{}
 	senders := map[common.Address]bool{}
 	nonces := map[common.Address]uint64{}
+	selector := map[string]any{"blockHash": anchor.Hash(), "requireCanonical": true}
+	// Cache one nonce per sender at the frozen canonical execution hash.
+	// NoM confirmation metadata cannot prove that an EVM nonce was used.
+	canonicalNonce := func(from common.Address) (uint64, error) {
+		if nonce, known := nonces[from]; known {
+			return nonce, nil
+		}
+		if !senders[from] {
+			if len(senders) >= limits.MaxSenders {
+				return 0, errors.New("recovery sender limit exceeded")
+			}
+			senders[from] = true
+		}
+		var nonce hexutil.Uint64
+		if err := r.cfg.Eth.Client().CallContext(ctx, &nonce, "eth_getTransactionCount", from, selector); err != nil {
+			return 0, errors.New("recovery canonical nonce unavailable")
+		}
+		nonces[from] = uint64(nonce)
+		return uint64(nonce), nil
+	}
 	for _, record := range journal {
 		_, from, err := r.admissionTransaction(record)
 		if err != nil {
@@ -365,9 +385,6 @@ func (r *Relayer) recoverInFlight(parent context.Context) error {
 				previous = block.Hash
 				seen[block.Hash] = block.Height
 				blocks++
-				if block.ConfirmationDetail != nil && anchor.Number.Uint64() >= r.cfg.Rollup.L2BlockForMomentum(block.ConfirmationDetail.MomentumHeight) {
-					continue
-				}
 				payload, err := r.recoveryPayload(ctx, q, block, seen)
 				if err != nil {
 					return err
@@ -381,11 +398,6 @@ func (r *Relayer) recoverInFlight(parent context.Context) error {
 				}
 				item := &recovered{shard: shard, block: block, bytes: len(payload) + 1}
 				for _, raw := range raws {
-					rawBytes += int64(len(raw))
-					transactions++
-					if rawBytes > limits.MaxRawBytes || transactions > limits.MaxTransactions {
-						return errors.New("recovery transaction retention limit exceeded")
-					}
 					tx := new(types.Transaction)
 					if tx.UnmarshalBinary(raw) != nil || tx.Protected() && tx.ChainId().Cmp(r.cfg.Rollup.L2ChainIDBig()) != 0 {
 						return errors.New("recovery transaction identity refused")
@@ -394,9 +406,18 @@ func (r *Relayer) recoverInFlight(parent context.Context) error {
 					if err != nil {
 						return errors.New("recovery transaction signature refused")
 					}
-					senders[sender] = true
-					if len(senders) > limits.MaxSenders {
-						return errors.New("recovery sender limit exceeded")
+					nonce, err := canonicalNonce(sender)
+					if err != nil {
+						return err
+					}
+					if tx.Nonce() < nonce {
+						continue
+					}
+					// Charge retained limits and copy bytes only for unused nonces.
+					rawBytes += int64(len(raw))
+					transactions++
+					if rawBytes > limits.MaxRawBytes || transactions > limits.MaxTransactions {
+						return errors.New("recovery transaction retention limit exceeded")
 					}
 					item.txs = append(item.txs, tx)
 					item.raws = append(item.raws, bytes.Clone(raw))
@@ -412,13 +433,10 @@ func (r *Relayer) recoverInFlight(parent context.Context) error {
 			return errors.New("recovery history does not reach its frozen frontier")
 		}
 	}
-	selector := map[string]any{"blockHash": anchor.Hash(), "requireCanonical": true}
 	for sender := range senders {
-		var nonce hexutil.Uint64
-		if err := r.cfg.Eth.Client().CallContext(ctx, &nonce, "eth_getTransactionCount", sender, selector); err != nil {
-			return errors.New("recovery canonical nonce unavailable")
+		if _, err := canonicalNonce(sender); err != nil {
+			return err
 		}
-		nonces[sender] = uint64(nonce)
 	}
 	for _, saved := range fences {
 		var actual *znn.AccountBlock

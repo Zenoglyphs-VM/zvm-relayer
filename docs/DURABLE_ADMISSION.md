@@ -64,3 +64,12 @@ replacement is refused while the original publication is outstanding. The
 fixture checks the public development account signature and exact carried
 transaction bytes; this controlled signature check does not authenticate a live
 NoM provider or establish canonicality/finality, wallet or power-loss acceptance.
+
+Recovery never treats a NoM confirmation annotation as proof that an EVM
+transaction executed. Every decoded signed transaction is validated, then one
+canonical-hash-selected nonce per sender decides whether its exact bytes remain
+pending. Already-used nonces are discarded before pending raw-byte and entry
+retention budgets or copies. Confirmation metadata still describes a recovered
+batch for tracking; it cannot discard an unused nonce at startup. Historical
+sender, full-source/RPC/response/decode/time limits remain explicit, and no
+persisted settled checkpoint or independent NoM finality proof is introduced.
