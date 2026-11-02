@@ -273,6 +273,10 @@ func (r *Relayer) recoverInFlight(parent context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(parent, limits.Timeout)
 	defer cancel()
+	journal, err := r.cfg.AdmissionStore.records()
+	if err != nil {
+		return err
+	}
 	q := &recoveryReader{limits: limits, client: &http.Client{Timeout: limits.Timeout}, endpoint: r.cfg.L1.URL()}
 	chainID, err := r.cfg.Eth.ChainID(ctx)
 	if err != nil || chainID == nil || chainID.Cmp(r.cfg.Rollup.L2ChainIDBig()) != 0 {
@@ -298,6 +302,16 @@ func (r *Relayer) recoverInFlight(parent context.Context) error {
 	addresses := map[znn.Address]bool{}
 	senders := map[common.Address]bool{}
 	nonces := map[common.Address]uint64{}
+	for _, record := range journal {
+		_, from, err := r.admissionTransaction(record)
+		if err != nil {
+			return err
+		}
+		senders[from] = true
+		if len(senders) > limits.MaxSenders {
+			return errors.New("recovery sender limit exceeded")
+		}
+	}
 	var blocks uint64
 	var rawBytes int64
 	transactions := 0
@@ -434,12 +448,12 @@ func (r *Relayer) recoverInFlight(parent context.Context) error {
 		staged.byShard[i] = map[common.Address]*sender{}
 	}
 	now := time.Now()
-	return r.installRecovery(ctx, staged, found, nonces, now)
+	return r.installRecovery(ctx, staged, found, nonces, now, journal...)
 }
 
 // installRecovery constructs the complete replacement before taking the lock;
 // a failed late account, nonce or collision check preserves all live maps.
-func (r *Relayer) installRecovery(ctx context.Context, staged *Relayer, found []*recovered, nonces map[common.Address]uint64, now time.Time) error {
+func (r *Relayer) installRecovery(ctx context.Context, staged *Relayer, found []*recovered, nonces map[common.Address]uint64, now time.Time, journal ...admissionRecord) error {
 	for _, item := range found {
 		b := &batch{shard: item.shard, block: item.block.Hash, height: item.block.Height, published: now, bytes: item.bytes}
 		if detail := item.block.ConfirmationDetail; detail != nil {
@@ -479,6 +493,10 @@ func (r *Relayer) installRecovery(ctx context.Context, staged *Relayer, found []
 			staged.inFlight[item.shard]++
 		}
 	}
+	admissionRecords, err := r.mergeAdmissionRecovery(staged, journal, nonces, now)
+	if err != nil {
+		return err
+	}
 	for _, s := range staged.senders {
 		s.settleCursor(0)
 	}
@@ -490,9 +508,15 @@ func (r *Relayer) installRecovery(ctx context.Context, staged *Relayer, found []
 	if len(r.byHash) != 0 || len(r.senders) != 0 || len(r.batches) != 0 {
 		return errors.New("recovery requires an empty startup lane")
 	}
+	if err := r.persistAdmissions(admissionRecords); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.senders, r.byHash, r.byShard, r.batches = staged.senders, staged.byHash, staged.byShard, staged.batches
 	r.load, r.inFlight, r.capacity, r.nPosted = staged.load, staged.inFlight, staged.capacity, staged.nPosted
-	r.nQueued = 0
+	r.nQueued = staged.nQueued
 	r.cfg.Log.Info("complete account history recovery finished", "batches", len(r.batches), "transactions", r.nPosted)
 	return nil
 }

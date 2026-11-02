@@ -49,12 +49,20 @@ func runRelayer(args []string) error {
 	if err != nil {
 		return err
 	}
+	admission := admissionStoreFlags(fs)
 	fs.Parse(args)
 	recoveryLimits, err := recovery.Checked()
 	if err != nil {
 		return err
 	}
 
+	admissionLimits, err := admission.Checked()
+	if err != nil {
+		return err
+	}
+	if *accounts == 0 || *accounts > 128 {
+		return errors.New("relayer account count must be between 1 and 128")
+	}
 	cfg, err := rollup.Load(*configPath)
 	if err != nil {
 		return err
@@ -93,6 +101,13 @@ func runRelayer(args []string) error {
 		if *minTip > 0 {
 			rc.MinTip = new(big.Int).SetUint64(*minTip)
 		}
+	}
+	if admission.Directory != "" {
+		rc.AdmissionStore, err = relayer.OpenAdmissionStore(admission.Directory, rc, admissionLimits)
+		if err != nil {
+			return err
+		}
+		defer rc.AdmissionStore.Close()
 	}
 	r := relayer.New(rc)
 

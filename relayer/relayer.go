@@ -36,6 +36,8 @@ import (
 const batchRoom = znn.MaxDataLength - 2
 
 type Config struct {
+	// AdmissionStore is optional synchronous local retention, separate from NoM finality.
+	AdmissionStore *AdmissionStore
 	// Recovery bounds complete startup history; exhaustion refuses admission.
 	Recovery RecoveryLimits
 	Rollup   *rollup.Config
@@ -108,14 +110,16 @@ const (
 )
 
 type entry struct {
-	tx       *types.Transaction
-	raw      []byte
-	from     common.Address
-	received time.Time
-	queuedAt time.Time
-	requeues int
-	state    state
-	batch    *batch
+	// publishing reserves the exact queued object through an external publish.
+	publishing bool
+	tx         *types.Transaction
+	raw        []byte
+	from       common.Address
+	received   time.Time
+	queuedAt   time.Time
+	requeues   int
+	state      state
+	batch      *batch
 }
 
 type sender struct {
@@ -212,11 +216,14 @@ type starve struct {
 }
 
 type Relayer struct {
-	admissionReady atomic.Bool
-	runStarted     atomic.Bool
-	recoveryPhase  atomic.Uint32
-	cfg            Config
-	signer         types.Signer
+	admissionFailure     chan struct{}
+	admissionFailureOnce sync.Once
+	admissionStoreError  error
+	admissionReady       atomic.Bool
+	runStarted           atomic.Bool
+	recoveryPhase        atomic.Uint32
+	cfg                  Config
+	signer               types.Signer
 
 	mu      sync.Mutex
 	senders map[common.Address]*sender
@@ -315,18 +322,19 @@ func New(cfg Config) *Relayer {
 		cfg.RebidInterval = 20 * time.Second
 	}
 	r := &Relayer{
-		cfg:      cfg,
-		signer:   types.LatestSignerForChainID(cfg.Rollup.L2ChainIDBig()),
-		senders:  map[common.Address]*sender{},
-		byHash:   map[common.Hash]*entry{},
-		wake:     make([]chan struct{}, len(cfg.Accounts)),
-		inFlight: make([]int, len(cfg.Accounts)),
-		room:     make([]int, len(cfg.Accounts)),
-		capacity: make([]uint64, len(cfg.Accounts)),
-		starved:  make([]starve, len(cfg.Accounts)),
-		adopted:  make(chan struct{}),
-		byShard:  make([]map[common.Address]*sender, len(cfg.Accounts)),
-		load:     make([]int, len(cfg.Accounts)),
+		cfg:              cfg,
+		admissionFailure: make(chan struct{}),
+		signer:           types.LatestSignerForChainID(cfg.Rollup.L2ChainIDBig()),
+		senders:          map[common.Address]*sender{},
+		byHash:           map[common.Hash]*entry{},
+		wake:             make([]chan struct{}, len(cfg.Accounts)),
+		inFlight:         make([]int, len(cfg.Accounts)),
+		room:             make([]int, len(cfg.Accounts)),
+		capacity:         make([]uint64, len(cfg.Accounts)),
+		starved:          make([]starve, len(cfg.Accounts)),
+		adopted:          make(chan struct{}),
+		byShard:          make([]map[common.Address]*sender, len(cfg.Accounts)),
+		load:             make([]int, len(cfg.Accounts)),
 	}
 	for i := range r.wake {
 		r.wake[i] = make(chan struct{}, 1)
@@ -477,6 +485,10 @@ func (r *Relayer) submit(ctx context.Context, raw []byte) (common.Hash, error) {
 	}
 
 	r.mu.Lock()
+	if !r.admissionStoreOperational() {
+		r.mu.Unlock()
+		return common.Hash{}, ErrAdmissionStoreUnavailable
+	}
 	if _, ok := r.byHash[tx.Hash()]; ok {
 		r.mu.Unlock()
 		return tx.Hash(), nil
@@ -506,19 +518,22 @@ func (r *Relayer) submit(ctx context.Context, raw []byte) (common.Hash, error) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if !r.admissionStoreOperational() {
+		return common.Hash{}, ErrAdmissionStoreUnavailable
+	}
+	if _, exists := r.byHash[tx.Hash()]; exists {
+		return tx.Hash(), nil
+	}
 	s := r.senders[from]
-	if s == nil {
-		s = &sender{addr: from, shard: r.pickShard(from), next: acct.nonce,
-			queued: map[uint64]*entry{}, posted: map[uint64]*entry{}}
-		r.senders[from] = s
-		r.byShard[s.shard][from] = s
-	} else if len(s.queued) == 0 && len(s.posted) == 0 {
-		// Idle: nothing of this sender's is in flight anywhere, so it is safe
-		// to move it to whichever account is least busy now.
-		if shard := r.pickShard(from); shard != s.shard {
-			delete(r.byShard[s.shard], from)
-			s.shard = shard
-			r.byShard[shard][from] = s
+	freshSender := s == nil
+	shard := 0
+	if freshSender {
+		shard = r.pickShard(from)
+		s = &sender{addr: from, shard: shard, next: acct.nonce, queued: map[uint64]*entry{}, posted: map[uint64]*entry{}}
+	} else {
+		shard = s.shard
+		if len(s.queued) == 0 && len(s.posted) == 0 {
+			shard = r.pickShard(from)
 		}
 	}
 	n := tx.Nonce()
@@ -541,17 +556,31 @@ func (r *Relayer) submit(ctx context.Context, raw []byte) (common.Hash, error) {
 		}
 	}
 	if old := s.queued[n]; old != nil {
+		if old.publishing {
+			return common.Hash{}, reject("nonce %d is being published", n)
+		}
 		// Replacement: only for a better fee, as a mempool would.
 		if tx.GasFeeCap().Cmp(old.tx.GasFeeCap()) <= 0 || tx.GasTipCap().Cmp(old.tx.GasTipCap()) <= 0 {
 			return common.Hash{}, reject("replacement transaction underpriced")
 		}
-		delete(r.byHash, old.tx.Hash())
 	}
 	now := time.Now()
+	e := &entry{tx: tx, raw: append([]byte(nil), raw...), from: from, received: now, queuedAt: now}
+	if err := r.persistNewAdmission(e, s.queued[n], shard); err != nil {
+		return common.Hash{}, err
+	}
+	if freshSender {
+		r.senders[from] = s
+		r.byShard[shard][from] = s
+	} else if s.shard != shard {
+		delete(r.byShard[s.shard], from)
+		s.shard = shard
+		r.byShard[shard][from] = s
+	}
 	if old := s.queued[n]; old != nil {
+		delete(r.byHash, old.tx.Hash())
 		r.nQueued--
 	}
-	e := &entry{tx: tx, raw: append([]byte(nil), raw...), from: from, received: now, queuedAt: now}
 	if s.queued[n] == nil {
 		r.load[s.shard]++
 	}
@@ -627,6 +656,15 @@ func (r *Relayer) Run(ctx context.Context) error {
 	if !r.runStarted.CompareAndSwap(false, true) {
 		return errors.New("relayer Run may only start once")
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := r.cfg.AdmissionStore.attach(r.cfg); err != nil {
+		r.recoveryPhase.Store(2)
+		if r.adopted != nil {
+			close(r.adopted)
+		}
+		return err
+	}
 	if err := r.recoverInFlight(ctx); err != nil {
 		r.recoveryPhase.Store(2)
 		if r.adopted != nil {
@@ -671,9 +709,18 @@ func (r *Relayer) Run(ctx context.Context) error {
 		defer wg.Done()
 		r.rebidder(ctx)
 	}()
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-r.admissionFailure:
+		cancel()
+	}
 	wg.Wait()
-	return ctx.Err()
+	select {
+	case <-r.admissionFailure:
+		return r.admissionStoreError
+	default:
+		return ctx.Err()
+	}
 }
 
 // ready collects the next postable run of transactions for a shard, oldest
@@ -703,7 +750,7 @@ func (r *Relayer) ready(shard int, gasCap uint64) ([]*entry, bool) {
 		flight := s.postedGas
 		for n := s.next; ; n++ {
 			e := s.queued[n]
-			if e == nil {
+			if e == nil || e.publishing {
 				break
 			}
 			if flight > 0 && flight+e.tx.Gas() > r.cfg.MaxBatchGas {
@@ -767,9 +814,13 @@ func (r *Relayer) poster(ctx context.Context, shard int) {
 				r.mu.Unlock()
 				break
 			}
+			for _, e := range candidates {
+				e.publishing = true
+			}
 			r.mu.Unlock()
 
 			if gasCap == 0 {
+				r.releasePublication(candidates)
 				// The block is already fully spoken for. Wait for the next momentum
 				// rather than pay for bytes the engine will refuse.
 				break
@@ -778,19 +829,29 @@ func (r *Relayer) poster(ctx context.Context, shard int) {
 			// spend the momentum's footprint on a block it will not post.
 			room := r.blockRoom(ctx, shard)
 			if room == 0 {
+				r.releasePublication(candidates)
 				r.starve(shard)
 				log.Debug("waiting a momentum for plasma")
 				break
 			}
 			if !r.cfg.Footprint.Take(r.l1Height.Load()) {
+				r.releasePublication(candidates)
 				// NoM has no room for this relayer in this momentum. Wait for
 				// the next one rather than crowd other users out at random.
 				break
 			}
 			entries, payloads, err := r.encode(candidates, room)
 			if err != nil {
+				r.releasePublication(candidates)
 				log.Error("encoding batch", "err", err)
 				break
+			}
+			if err := r.reservePublication(candidates, entries, shard); err != nil {
+				r.releasePublication(candidates)
+				if r.cfg.AdmissionStore != nil {
+					r.failAdmissionStore(err)
+				}
+				return
 			}
 			// Charge the forecast what each block actually costs NoM, as it goes
 			// out. On v2 that is plasma, where a small block costs a fraction of
@@ -799,6 +860,11 @@ func (r *Relayer) poster(ctx context.Context, shard int) {
 				r.cfg.Footprint.Spend(r.l1Height.Load(), n)
 			})
 			if err != nil {
+				if r.cfg.AdmissionStore != nil {
+					r.failAdmissionStore(ErrAdmissionPublicationUnknown)
+					return
+				}
+				r.releasePublication(entries)
 				r.stats.PublishErrors.Add(1)
 				log.Warn("publishing batch", "err", err, "txs", len(entries))
 				acct.Reset()
@@ -827,7 +893,12 @@ func (r *Relayer) poster(ctx context.Context, shard int) {
 				b.bytes += len(p)
 			}
 			r.mu.Lock()
+			if err := r.persistPosted(entries, shard); err != nil {
+				r.mu.Unlock()
+				return
+			}
 			for _, e := range entries {
+				e.publishing = false
 				s := r.senders[e.from]
 				delete(s.queued, e.tx.Nonce())
 				r.nQueued--
@@ -1203,6 +1274,10 @@ func (r *Relayer) settle(ctx context.Context, b *batch, included map[common.Hash
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	transitionTime := time.Now()
+	if err := r.persistSettlement(b, included, nonces, unaffordable, transitionTime); err != nil {
+		return
+	}
 	// The lowest nonce each sender may post from once this batch is settled:
 	// the account's nonce where it was read, and past every included one
 	// otherwise, since an included nonce is a used one.
@@ -1259,7 +1334,7 @@ func (r *Relayer) settle(ctx context.Context, b *batch, included map[common.Hash
 		}
 		// A fresh wait: QueueTTL is for how long an entry has been stuck behind a
 		// gap, not how long ago the client first sent it.
-		e.state, e.batch, e.queuedAt = queued, nil, time.Now()
+		e.state, e.batch, e.queuedAt = queued, nil, transitionTime
 		s.queued[e.tx.Nonce()] = e
 		r.nQueued++
 		r.stats.Requeued.Add(1)
@@ -1316,6 +1391,9 @@ func (r *Relayer) sweep() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now()
+	if err := r.persistSweep(now); err != nil {
+		return
+	}
 	for addr, s := range r.senders {
 		// Only a gapped entry is stale. One that is merely waiting its turn —
 		// behind this sender's own earlier nonces, or for gas in the lane — is
@@ -1324,7 +1402,7 @@ func (r *Relayer) sweep() {
 		// longer than QueueTTL, so the tail was discarded and never arrived.
 		live := s.reachable()
 		for n, e := range s.queued {
-			if live[n] || now.Sub(e.queuedAt) <= r.cfg.QueueTTL {
+			if e.publishing || live[n] || now.Sub(e.queuedAt) <= r.cfg.QueueTTL {
 				continue
 			}
 			delete(s.queued, n)
@@ -1343,25 +1421,26 @@ func (r *Relayer) sweep() {
 
 // Snapshot is the relayer's status.
 type Snapshot struct {
-	Ready            bool     `json:"ready"`
-	RecoveryStatus   string   `json:"recoveryStatus"`
-	AdmissionMode    string   `json:"admissionMode"`
-	AdmissionDurable bool     `json:"admissionDurable"`
-	Accounts         []string `json:"accounts"`
-	Queued           int      `json:"queued"`
-	PostedPending    int      `json:"postedPending"`
-	InFlight         []int    `json:"inFlightBlocks"`
-	Senders          int      `json:"senders"`
-	Received         uint64   `json:"received"`
-	Rejected         uint64   `json:"rejected"`
-	Posted           uint64   `json:"posted"`
-	Included         uint64   `json:"included"`
-	Requeued         uint64   `json:"requeued"`
-	Discarded        uint64   `json:"discarded"`
-	Batches          uint64   `json:"batches"`
-	BatchBytes       uint64   `json:"batchBytes"`
-	RawBytes         uint64   `json:"rawBytes"`
-	PublishErrors    uint64   `json:"publishErrors"`
+	AdmissionStorage *AdmissionStoreStats `json:"admissionStorage,omitempty"`
+	Ready            bool                 `json:"ready"`
+	RecoveryStatus   string               `json:"recoveryStatus"`
+	AdmissionMode    string               `json:"admissionMode"`
+	AdmissionDurable bool                 `json:"admissionDurable"`
+	Accounts         []string             `json:"accounts"`
+	Queued           int                  `json:"queued"`
+	PostedPending    int                  `json:"postedPending"`
+	InFlight         []int                `json:"inFlightBlocks"`
+	Senders          int                  `json:"senders"`
+	Received         uint64               `json:"received"`
+	Rejected         uint64               `json:"rejected"`
+	Posted           uint64               `json:"posted"`
+	Included         uint64               `json:"included"`
+	Requeued         uint64               `json:"requeued"`
+	Discarded        uint64               `json:"discarded"`
+	Batches          uint64               `json:"batches"`
+	BatchBytes       uint64               `json:"batchBytes"`
+	RawBytes         uint64               `json:"rawBytes"`
+	PublishErrors    uint64               `json:"publishErrors"`
 	// Rebids counts blocks replaced because they had fallen behind the plasma
 	// price. On a chain without dynamic plasma it stays zero.
 	Rebids uint64 `json:"rebids"`
@@ -1466,8 +1545,9 @@ func (r *Relayer) senderStatuses(limit int) []SenderStatus {
 func (r *Relayer) Snapshot() Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	admissionMode, admissionDurable, admissionStorage := r.admissionStatus()
 	s := Snapshot{
-		Ready: r.Ready(), RecoveryStatus: r.recoveryStatus(), AdmissionMode: "volatile", AdmissionDurable: false,
+		Ready: r.Ready(), RecoveryStatus: r.recoveryStatus(), AdmissionMode: admissionMode, AdmissionDurable: admissionDurable, AdmissionStorage: admissionStorage,
 		InFlight: append([]int(nil), r.inFlight...), Senders: len(r.senders),
 		Received: r.stats.Received.Load(), Rejected: r.stats.Rejected.Load(), Posted: r.stats.Posted.Load(),
 		Included: r.stats.Included.Load(), Requeued: r.stats.Requeued.Load(), Discarded: r.stats.Discarded.Load(),

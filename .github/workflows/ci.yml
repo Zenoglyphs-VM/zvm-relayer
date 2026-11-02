@@ -41,7 +41,7 @@ jobs:
         run: test "$(git -C zvm-core rev-parse HEAD)" = 29e6d9b30be94de3772c850c7a1e9811585a8833
       - name: Build the actual production relayer with race instrumentation
         run: go build -race -o "$RUNNER_TEMP/zvm-relayer-recovery" ./cmd/zvm-relayer
-      - name: Qualify complete-history recovery and volatile acknowledgment in real processes
+      - name: Qualify complete history and volatile or synchronous local admission in real processes
         env:
           ZVM_RELAYER_RECOVERY_BINARY: ${{ runner.temp }}/zvm-relayer-recovery
-        run: go test -race -json -count=1 -timeout=3m -run '^TestRecoveryCLIProcesses$' ./cmd/zvm-relayer
+        run: go test -race -json -count=1 -timeout=3m -run '^Test(RecoveryCLIProcesses|DurableAdmissionCLIProcesses)$' ./cmd/zvm-relayer
